@@ -1,0 +1,1139 @@
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+import math
+
+# from model_utils import CausalConv1D
+import sys
+
+# sys.path.append(r"/home/ubuntu/Desktop/action_generation/model")
+from .model_utils import (
+    CausalConv2D,
+    conv3d_lerelu_maxpl,
+    gaussian_parameters,
+    sample_gaussian,
+    conv3d,
+    repeat_like,
+    DiffDecoder,
+    soft_pool2d,
+)
+from .decoders import ActGenerate, SuckerAct, ImagesGenerate, XLstmStack
+from .convlstm import ConvLSTM
+from .critic import Critic
+from misc import VariableContainer
+
+sys.path.append("..")
+
+from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D
+from denoising_diffusion_pytorch import Unet, GaussianDiffusion
+from model.snn import CSNN, SNNActDecoder, DownConvSNN
+from script.latenz_visualize import visualize_fn
+
+# Language encoder for LIBERO support
+try:
+    from model.language_encoder import CLIPLanguageEncoder, LanguageConditionedFusion
+
+    HAS_LANGUAGE_ENCODER = True
+except ImportError:
+    HAS_LANGUAGE_ENCODER = False
+
+torch_dtype_map: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
+class ActNet(nn.Module):
+    def __init__(self, xlstm_cfg, is_use_cuda=False, device="vanilla"):
+        super(ActNet, self).__init__()
+        self.device = device
+        self.xlstm_cfg = xlstm_cfg
+        self.enc_out_dim = xlstm_cfg.model.embedding_dim * 2
+        self.modalities_seq_dim = (
+            xlstm_cfg.model.embedding_dim * 2 + xlstm_cfg.act_model_enc.embedding_dim
+        )
+        self.compute_error = ComputeLIFResiduals(
+            is_use_snn_residual=xlstm_cfg.is_use_snn_residual
+        )
+
+        # Language encoder for LIBERO
+        self.use_language = getattr(xlstm_cfg, "use_language", False)
+        if self.use_language and HAS_LANGUAGE_ENCODER:
+            clip_model = getattr(xlstm_cfg, "clip_model", "ViT-B/32")
+            language_output_dim = getattr(
+                xlstm_cfg, "language_output_dim", xlstm_cfg.model.embedding_dim
+            )
+            self.language_encoder = CLIPLanguageEncoder(
+                clip_model=clip_model,
+                output_dim=language_output_dim,
+                device=device if device != "vanilla" else "cpu",
+            )
+            # Projection layer to match language dim to visual/action feature dim
+            self.language_proj = nn.Linear(language_output_dim, self.enc_out_dim)
+            # Update modalities_seq_dim: language adds 1 sequence position (not enc_out_dim)
+            # Total = 120*2 (visual) + 120 (action) + 1 (language) = 361
+            self.modalities_seq_dim += 1
+            num_modalities = 3  # visual x2 + action + language
+        else:
+            self.language_encoder = None
+            self.language_proj = None
+            num_modalities = 2
+
+        self.modal_fusion_model = MultiModalFusionModel(
+            num_modalities=num_modalities,
+            z_dim=self.xlstm_cfg.z_dim,
+            embedding_dim=xlstm_cfg.model.embedding_dim,
+            xlstm_cfg=xlstm_cfg,
+            use_language=self.use_language,
+        )
+        # self.modal_fusion_model.apply(init_weights)
+        if xlstm_cfg.act_encoder == "causalconv":
+            self.causal_model = CausalNet(z_dim=self.enc_out_dim, xlstm_cfg=xlstm_cfg)
+        elif xlstm_cfg.act_encoder == "transformerxlstm":
+            self.transbilstm = TransformerXLSTM(
+                input_channels=xlstm_cfg.action_dim,
+                embed_dim=xlstm_cfg.transformer.embed_dim,
+                hidden_dim=xlstm_cfg.act_model_enc.context_length,
+                num_layers=xlstm_cfg.transformer.num_layers,
+                num_heads=xlstm_cfg.transformer.num_heads,
+                output_dim=xlstm_cfg.transformer.embed_dim * 2,
+                config=xlstm_cfg,
+            )
+        elif xlstm_cfg.act_encoder == "xlstm":
+            xlstm_cfg.act_model_enc.num_blocks = (
+                xlstm_cfg.transformer.num_layers + xlstm_cfg.act_model_enc.num_blocks
+            )
+            self.act_xlstm = XLstmStack(self.xlstm_cfg.act_model_enc, device=device)
+        else:
+            raise ValueError("action encoder keyword error")
+
+        if self.xlstm_cfg.visual_encoder == "diffusion":
+            self.con3d_1 = conv3d_lerelu_maxpl(64, 64, (3, 3, 3), (1, 1, 1), (1, 2, 2))
+            self.con3d_2 = conv3d_lerelu_maxpl(64, 64, (3, 3, 3), (1, 1, 1), (1, 1, 1))
+            #
+
+            self.grip_diff = ImageDiffusion()
+            self.side_diff = ImageDiffusion()
+
+            self.grip_dnc = DiffDecoder(xlstm_cfg, 1, 1)
+            self.side_dnc = DiffDecoder(xlstm_cfg, 1, 1)
+            self.conv_lstm = ConvLstmEnc(input_channels=3, output_channel=128)
+        else:
+            # the shape related grip_init_conv3d output shape
+            self.grip_xlstm_layers = XLstmStack(
+                self.xlstm_cfg.model, device=self.device, shape=[38, 38]
+            )
+            self.side_xlstm_layers = XLstmStack(
+                self.xlstm_cfg.model, device=self.device, shape=[38, 38]
+            )
+            self.grip_img_generate = ImagesGenerate(
+                z_dim=self.xlstm_cfg.z_dim,
+                batch_size=self.xlstm_cfg.batchsize,
+                xlstm_cfg=xlstm_cfg,
+            )
+            self.side_img_generate = ImagesGenerate(
+                z_dim=self.xlstm_cfg.z_dim,
+                batch_size=self.xlstm_cfg.batchsize,
+                xlstm_cfg=xlstm_cfg,
+            )
+
+        if self.xlstm_cfg.is_diff_generate_act:
+            unet1d = Unet1D(dim=8, dim_mults=(1, 2, 4, 8), channels=100)
+            self.diffusion = GaussianDiffusion1D(
+                unet1d, seq_length=384, timesteps=500, objective="pred_v"
+            )
+
+        if xlstm_cfg.snn.is_use:
+            self.act_generate = SNNActDecoder(
+                act_dim=9, hidden_dim=120, config=xlstm_cfg
+            )
+        else:
+            self.act_generate = ActGenerate(
+                input_dim=self.enc_out_dim,
+                z_dim=self.xlstm_cfg.z_dim,
+                device=self.device,
+                xlstm_cfg=xlstm_cfg,
+            )
+        self.sucker_act = SuckerAct(
+            z_dim=self.xlstm_cfg.z_dim, device=self.device, xlstm_cfg=xlstm_cfg
+        )
+        # print(self.xlstm_layers.xlstm_layer_config)
+        self.output = VariableContainer()
+        self.self_attentions = SelfAttentions(
+            input_dim=xlstm_cfg.act_model_enc.embedding_dim,
+            seq_len=xlstm_cfg.act_model_enc.embedding_dim,
+            eq_output=True,
+        )
+        # act_attn input is z_mix (z_dim=120) + act_out (embed_dim*2=240) = 360
+        # This is different from modalities_seq_dim which includes language offset
+        act_attn_input_dim = xlstm_cfg.z_dim + xlstm_cfg.transformer.embed_dim * 2
+        self.act_attn = SelfAttentions(
+            input_dim=act_attn_input_dim,
+            seq_len=xlstm_cfg.act_model_enc.embedding_dim,
+            eq_output=True,
+        )
+        # self.self_attentions.apply(init_weights)
+        # print(self.xlstm_layers.xlstm)
+        # if xlstm_cfg.snn.is_use:
+        #     self.grip_init_conv3d = RGB2Spike(self.in_channels, self.xlstm_cfg.model.embedding_dim, config=xlstm_cfg)
+        #     self.side_init_conv3d = RGB2Spike(self.in_channels, self.xlstm_cfg.model.embedding_dim, config=xlstm_cfg)
+        # else:
+        self.grip_init_conv3d = conv3d(
+            xlstm_cfg.past_img_num + 1,
+            self.xlstm_cfg.enc_out_dim,
+            kernel_size=(3, 5, 5),
+            stride=(3, 3, 3),
+            padding=(0, 1, 1),
+        )
+        self.side_init_conv3d = conv3d(
+            xlstm_cfg.past_img_num + 1,
+            self.xlstm_cfg.enc_out_dim,
+            kernel_size=(3, 5, 5),
+            stride=(3, 3, 3),
+            padding=(0, 1, 1),
+        )
+        if xlstm_cfg.snn.is_use:
+            self.grip_down_conv = DownConvSNN(
+                self.xlstm_cfg.enc_out_dim, self.enc_out_dim, config=xlstm_cfg
+            )
+            self.side_down_conv = DownConvSNN(
+                self.xlstm_cfg.enc_out_dim, self.enc_out_dim, config=xlstm_cfg
+            )
+        else:
+            self.grip_down = MultiHeadAttention(
+                head=4, dim=38 * 38, output_dim=self.enc_out_dim
+            )
+            self.side_down = MultiHeadAttention(
+                head=4, dim=38 * 38, output_dim=self.enc_out_dim
+            )
+
+        if xlstm_cfg.snn.is_use:
+            self.grip_last_frame_draw_feat = CSNN(
+                T=xlstm_cfg.snn.T, channels=3, out_channel=11, config=xlstm_cfg
+            )
+            self.side_last_frame_draw_feat = CSNN(
+                T=xlstm_cfg.snn.T, channels=3, out_channel=11, config=xlstm_cfg
+            )
+            # self.act_spike = ActionSpikeEncode(xlstm_cfg.per_image_with_signal_num, 11, self.enc_out_dim, xlstm_cfg.snn.T, xlstm_cfg)
+        else:
+            self.grip_last_frame_draw_feat = DrawLastFrameFeature(
+                in_channels=9, out_channels=xlstm_cfg.enc_out_dim, config=xlstm_cfg
+            )
+            # self.grip_last_frame_draw_feat.apply(init_weights)
+            self.side_last_frame_draw_feat = DrawLastFrameFeature(
+                in_channels=9, out_channels=xlstm_cfg.enc_out_dim, config=xlstm_cfg
+            )
+            # self.side_last_frame_draw_feat.apply(init_weights)
+        self.critic = Critic(out_channels=xlstm_cfg.action_dim, config=xlstm_cfg)
+        full_act_seq_len = (
+            xlstm_cfg.max_history * xlstm_cfg.past_img_num + xlstm_cfg.future_img_num
+        ) * xlstm_cfg.per_image_with_signal_num
+        self.act_norm1 = nn.BatchNorm1d(full_act_seq_len)
+        self.act_norm2 = nn.BatchNorm1d(
+            xlstm_cfg.future_img_num * xlstm_cfg.per_image_with_signal_num
+        )
+        self.act_norm3 = nn.BatchNorm1d(
+            (xlstm_cfg.max_history * xlstm_cfg.past_img_num)
+            * xlstm_cfg.per_image_with_signal_num
+        )
+        self.img_norm = nn.BatchNorm3d(
+            xlstm_cfg.past_img_num + xlstm_cfg.future_img_num
+        )
+        self.norm_3 = nn.BatchNorm1d(self.enc_out_dim)
+        self.shape_feature = nn.Linear(158, xlstm_cfg.z_dim * 2)
+
+        self.hist_len = xlstm_cfg.past_img_num  # 期望历史长度L
+        self.register_buffer("grip_hist", None, persistent=False)
+        self.register_buffer("side_hist", None, persistent=False)
+        # image normalize buffer (ImageNet mean/std by default)
+        self.register_buffer(
+            "img_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "img_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def reset_history(self):
+        self.grip_hist = None
+        self.side_hist = None
+
+    def _push_frame(self, grip_frame, side_frame):
+        # grip_frame/side_frame: [B, C, H, W]
+        with torch.no_grad():
+            if self.grip_hist is None:
+                # 用首帧填充历史，也可用零填充：torch.zeros_like(...).repeat(...)
+                self.grip_hist = (
+                    grip_frame.unsqueeze(1).repeat(1, self.hist_len, 1, 1, 1).detach()
+                )
+                self.side_hist = (
+                    side_frame.unsqueeze(1).repeat(1, self.hist_len, 1, 1, 1).detach()
+                )
+            else:
+                self.grip_hist = torch.cat(
+                    [self.grip_hist[:, 1:], grip_frame.unsqueeze(1)], dim=1
+                ).detach()
+                self.side_hist = torch.cat(
+                    [self.side_hist[:, 1:], side_frame.unsqueeze(1)], dim=1
+                ).detach()
+
+    def _get_history(self):
+        # 返回 [B, S=L, C, H, W]
+        return self.grip_hist, self.side_hist
+
+    def _preprocess_frame(
+        self, frame: torch.Tensor, augment: bool = False
+    ) -> torch.Tensor:
+        # frame: [B, C, H, W] in [0,1] or [0,255]
+        target_h = getattr(self.xlstm_cfg, "cropHeight", 112)
+        target_w = getattr(self.xlstm_cfg, "cropWidth", 112)
+        x = frame
+        if x.dtype != torch.float32:
+            x = x.float()
+        # scale to [0,1] if appears to be 0-255
+        if torch.isfinite(x).all() and x.max() > 1.5:
+            x = x / 255.0
+        # resize to target size
+        if x.size(-2) != target_h or x.size(-1) != target_w:
+            x = F.interpolate(
+                x, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+        # simple data augmentation during training only
+        if augment:
+            # random horizontal flip (prob=0.5)
+            if torch.rand((), device=x.device) < 0.5:
+                x = torch.flip(x, dims=[-1])
+            # lightweight brightness/contrast jitter
+            b = 1.0 + (torch.rand(x.size(0), 1, 1, 1, device=x.device) * 0.4 - 0.2)
+            c = 1.0 + (torch.rand(x.size(0), 1, 1, 1, device=x.device) * 0.4 - 0.2)
+            x = x * c + (b - 1.0)
+            # small gaussian noise
+            x = torch.clamp(x, 0.0, 1.0)
+            noise = torch.randn_like(x) * 0.02
+            x = torch.clamp(x + noise, 0.0, 1.0)
+        # normalize
+        mean = self.img_mean.to(x.device)
+        std = self.img_std.to(x.device)
+        x = (x - mean) / std
+        return x
+
+    def forward(self, batch, phase: str = ""):
+        # 图像预处理：尺寸统一、归一化、训练阶段可选增强
+        use_aug = phase == "train"
+        grip_curr = self._preprocess_frame(
+            batch["observation"]["top_image"], augment=use_aug
+        )
+        side_curr = self._preprocess_frame(
+            batch["observation"]["wrist_image"], augment=use_aug
+        )
+        # self._push_frame(grip_curr, side_curr)
+
+        # 取出完整序列 [B, S, C, H, W]
+        # gripper_hist, side_hist = self._get_history()
+
+        grip_full_seq_error = self.compute_error(
+            batch["observation"]["wrist_image_seq"]
+        )
+        side_full_seq_error = self.compute_error(batch["observation"]["top_image_seq"])
+        top_seq = [
+            self._preprocess_frame(
+                batch["observation"]["top_image_seq"][:, i, ...], augment=use_aug
+            ).unsqueeze(1)
+            for i in range(batch["observation"]["top_image_seq"].shape[1])
+        ]
+        batch["observation"]["top_image"] = torch.cat(top_seq, dim=1)
+        wrist_seq = [
+            self._preprocess_frame(
+                batch["observation"]["wrist_image_seq"][:, i, ...], augment=use_aug
+            ).unsqueeze(1)
+            for i in range(batch["observation"]["wrist_image_seq"].shape[1])
+        ]
+        batch["observation"]["wrist_image_seq"] = torch.cat(wrist_seq, dim=1)
+
+        grip_out = self.grip_init_conv3d(
+            batch["observation"]["wrist_image_seq"][
+                :, : -self.xlstm_cfg.future_img_num, ...
+            ]
+        )
+        side_out = self.side_init_conv3d(
+            batch["observation"]["top_image_seq"][
+                :, : -self.xlstm_cfg.future_img_num, ...
+            ]
+        )
+
+        if self.xlstm_cfg.visual_encoder == "diffusion":
+            grip_conv_out_1 = self.con3d_1(grip_out)
+            grip_conv_out_2 = self.con3d_2(grip_conv_out_1)
+
+            side_conv_out_1 = self.con3d_1(side_out)
+            side_conv_out_2 = self.con3d_2(side_conv_out_1)
+
+            if not self.xlstm_cfg.olny_action_generate:
+                grip_layers_out = [grip_conv_out_1, grip_conv_out_2]
+                side_layers_out = [side_conv_out_1, side_conv_out_2]
+
+                b, s, c, h, w = grip_conv_out_2.shape
+                grip_conv_out_2_ = grip_conv_out_2.reshape(-1, 1, c, h, w).squeeze(1)
+                self.output.grip_diff_loss = self.grip_diff(grip_conv_out_2_)
+
+                side_conv_out_2_ = side_conv_out_2.reshape(-1, 1, c, h, w).squeeze(1)
+                self.output.side_diff_loss = self.side_diff(side_conv_out_2_)
+
+            else:
+                self.output.grip_diff_loss = None
+                self.output.side_diff_loss = None
+            grip_eq_hw = grip_conv_out_2_.transpose(1, 2).repeat(1, 1, 1, 2, 1)[
+                :, :, :, :32, :
+            ]
+            grip_visual_out = self.conv_lstm(grip_eq_hw)
+            b, s, c, h, w = grip_visual_out.shape
+            grip_visual_out = grip_visual_out.reshape(b, 256, -1, h, w)
+
+            side_eq_hw = side_conv_out_2_.transpose(1, 2).repeat(1, 1, 1, 2, 1)[
+                :, :, :, :32, :
+            ]
+            side_visual_out = self.conv_lstm(side_eq_hw)
+            b, s, c, h, w = side_visual_out.shape
+            side_visual_out = side_visual_out.reshape(b, 256, -1, h, w)
+        else:  # visual_encoder: xlstm
+            B, S, C, H, W = grip_out.shape
+            grip_xlstm_out = self.grip_xlstm_layers.xlstm(grip_out.reshape(B, S, -1))
+            side_xlstm_out = self.side_xlstm_layers.xlstm(side_out.reshape(B, S, -1))
+
+            grip_visual_out = self.grip_down(grip_xlstm_out)
+            side_visual_out = self.side_down(side_xlstm_out)
+
+            self.output.grip_diff_loss = None
+            self.output.side_diff_loss = None
+
+        grip_future_seq = []
+        side_future_seq = []
+        act_future_seq = []
+        act_mu_list = []
+        act_std_list = []
+        suck_list = []
+        weights_list = []
+        bias_list = []
+        self.output.pred_state = {}
+
+        for ith in range(self.xlstm_cfg.future_img_num + 1):
+            self.output.pred_state[f"{ith}"] = []
+            #  action + visual frame encode
+            if ith < self.xlstm_cfg.future_img_num:
+                t = -self.xlstm_cfg.future_img_num - 1 + ith
+                grip_last_frame = batch["observation"]["wrist_image_seq"][:, t, ...]
+                side_last_frame = batch["observation"]["top_image_seq"][:, t, ...]
+                # use t-1
+                grip_last_frame_feat = self.grip_last_frame_draw_feat(
+                    grip_last_frame, grip_full_seq_error[:, t - 1, ...]
+                )
+                side_last_frame_feat = self.side_last_frame_draw_feat(
+                    side_last_frame, side_full_seq_error[:, t - 1, ...]
+                )
+
+                vis_act_feat = torch.cat(
+                    [
+                        grip_last_frame_feat,
+                        side_last_frame_feat,
+                        batch["observation"]["state"]
+                        .unsqueeze(1)
+                        .repeat(1, self.xlstm_cfg.enc_out_dim, 1),
+                    ],
+                    dim=1,
+                )
+                if self.xlstm_cfg.act_encoder == "causalconv":
+                    act_out = self.causal_model(batch["obsetvation"]["state"])
+                elif self.xlstm_cfg.act_encoder == "transformerxlstm":
+                    # vis_act_feat = vis_act_feat.reshape(self.xlstm_cfg.batchsize, self.xlstm_cfg.act_model_enc.embedding_dim, -1)
+                    act_out = self.transbilstm(vis_act_feat)
+                elif self.xlstm_cfg.act_encoder == "xlstm":
+                    vis_act_feat = vis_act_feat.reshape(
+                        self.xlstm_cfg.batchsize,
+                        self.xlstm_cfg.act_model_enc.embedding_dim,
+                        -1,
+                        1,
+                        1,
+                    )
+                    act_out = self.act_xlstm.xlstm(vis_act_feat)
+                    act_out = act_out.repeat(
+                        1, 1, self.enc_out_dim // act_out.size(2) + 1, 1, 1
+                    )[:, :, : self.enc_out_dim, ...].transpose(1, 2)
+
+            if self.xlstm_cfg.is_use_mam:
+                # Encode language if available
+                modalities_list = [grip_visual_out, side_visual_out, act_out]
+                if (
+                    self.use_language
+                    and self.language_encoder is not None
+                    and "language" in batch
+                ):
+                    lang_input = batch["language"]
+                    lang_embedding = self.language_encoder(lang_input)  # [B, lang_dim]
+                    # Project to match other modality dimensions
+                    lang_embedding = self.language_proj(
+                        lang_embedding
+                    )  # [B, enc_out_dim]
+                    # Expand to match other modality dimensions [B, 1, enc_out_dim]
+                    lang_embedding = lang_embedding.unsqueeze(1)
+                    modalities_list.append(lang_embedding)
+                fused_modal = self.modal_fusion_model(modalities_list)
+            else:
+                grip_out_temp = torch.flatten(grip_visual_out, start_dim=2)
+                side_out_temp = torch.flatten(side_visual_out, start_dim=2)
+                act_out_temp = torch.flatten(act_out, start_dim=2)
+                features = torch.cat(
+                    [grip_out_temp, side_out_temp, act_out_temp], dim=-1
+                )
+                if (
+                    self.use_language
+                    and self.language_encoder is not None
+                    and "language" in batch
+                ):
+                    lang_input = batch["language"]
+                    lang_embedding = self.language_encoder(lang_input)
+                    features = torch.cat(
+                        [
+                            features,
+                            lang_embedding.unsqueeze(1).expand(
+                                -1, features.size(1), -1
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                fused_modal = self.shape_feature(features)
+            self.output.mu, self.output.var = gaussian_parameters(fused_modal)
+            z_mix = sample_gaussian(
+                self.output.mu,
+                self.output.var,
+                device=self.device,
+                z_attention=self.xlstm_cfg.z_attention,
+                SelfAttentions=self.self_attentions,
+                training_phase=phase,
+            )
+            # visualize z
+
+            # zt = torch.cat([torch.flatten(grip_visual_out, start_dim=2), torch.flatten(side_visual_out, start_dim=2), act_out], dim=-1)
+            # visualize_fn(fused_modal, n_components=2)
+            # visualize_fn(z_mix, n_components=2)
+
+            ### actions
+            if ith < self.xlstm_cfg.future_img_num:
+                if self.xlstm_cfg.is_diff_generate_act:
+                    # diffusion input mode 1: z, encoder_output, act_seq
+                    act_rep = repeat_like(
+                        torch.flatten(batch["obsetvation"]["state"], start_dim=2), z_mix
+                    )
+                    act_out_rep = repeat_like(act_out.squeeze(-1), z_mix)
+                    act_z_enc = torch.cat([act_rep, z_mix, act_out_rep], dim=-1)
+                    self.output.actions_loss = self.diffusion(act_z_enc)
+                    self.output.act_diff = self.diffusion.sample(
+                        batch_size=self.xlstm_cfg.batchsize
+                    )
+                    next_act = self.act_generate(self.output.act_diff)
+                else:
+                    # z_mix_act_out = self.self_attentions(z_mix, act_out.squeeze(-1).squeeze(-1))
+                    z_mix_act_out = torch.cat([z_mix, act_out], dim=-1)
+                    # z_mix_act_out = self.norm_3(z_mix_act_out)
+                    z_mix_act_out = self.act_attn(z_mix_act_out)
+                    act_mu, act_std, next_act = self.act_generate(z_mix_act_out)
+                act_future_seq.append(next_act)
+                if act_mu is not None and act_std is not None:
+                    act_mu_list.append(act_mu)
+                    act_std_list.append(act_std)
+                self.output.pred_state[f"{ith}"].append(next_act)
+                ### sucker action
+                pred_sucker = self.sucker_act(z_mix)
+                suck_list.append(pred_sucker)
+                self.output.pred_state[f"{ith}"].append(pred_sucker)
+
+            ### generate images
+            # skip_layers = [xlstm_out, visual_out]
+            if (
+                not self.xlstm_cfg.olny_action_generate
+                and self.xlstm_cfg.act_encoder == "transformerxlstm"
+            ):
+                next_frame = None
+                t_1 = -self.xlstm_cfg.future_img_num + ith
+                grip_last_frame = batch["observation"]["wrist_image_seq"][:, t_1, ...]
+
+                side_last_frame = batch["observation"]["top_image_seq"][:, t_1, ...]
+
+                if next_frame is None:
+                    grip_next_frame = grip_curr
+                    side_next_frame = side_curr
+
+                grip_error = grip_full_seq_error[:, t_1, ...]
+                side_error = side_full_seq_error[:, t_1, ...]
+
+                grip_next_frame = self.grip_img_generate(
+                    z_mix,
+                    grip_last_frame.unsqueeze(1),
+                    grip_error.unsqueeze(1),
+                    batch["obsetvation"]["state"],
+                )
+                side_next_frame = self.side_img_generate(
+                    z_mix,
+                    side_last_frame.unsqueeze(1),
+                    side_error.unsqueeze(1),
+                    batch["obsetvation"]["state"],
+                )
+
+                grip_future_seq.append(grip_next_frame)
+                side_future_seq.append(side_next_frame)
+
+                self.output.pred_state[f"{ith}"].append(grip_next_frame.squeeze())
+                self.output.pred_state[f"{ith}"].append(side_next_frame.squeeze())
+            # weights & bias
+            if ith < self.xlstm_cfg.future_img_num:
+                weights, bias = self.critic(self.output.pred_state[f"{ith}"])
+                weights_list.append(weights)
+                bias_list.append(bias)
+
+        if grip_future_seq != []:
+            self.output.grip_future_seq = torch.cat(
+                grip_future_seq[: self.xlstm_cfg.future_img_num], dim=1
+            )
+            self.output.side_future_seq = torch.cat(
+                side_future_seq[: self.xlstm_cfg.future_img_num], dim=1
+            )
+            self.output.grip_future_seq_more = torch.cat(grip_future_seq, dim=1)
+            self.output.side_future_seq_more = torch.cat(side_future_seq, dim=1)
+        if act_std_list != []:
+            self.output.act_mu = torch.cat(act_mu_list, dim=1)
+            self.output.act_std = torch.cat(act_std_list, dim=1)
+        else:
+            self.output.act_mu = None
+            self.output.act_std = None
+        self.output.actions = torch.cat(act_future_seq, dim=1)
+        self.output.sucker = torch.cat(suck_list, dim=1)
+        self.output.weights = torch.cat(weights_list, dim=1)
+        self.output.bias = torch.cat(bias_list, dim=1)
+
+        return self.output
+
+
+class ComputeLIFResiduals(nn.Module):
+    def __init__(self, threshold=0.5, is_use_snn_residual=False):
+        super(ComputeLIFResiduals, self).__init__()
+        self.threshold = threshold
+        self.mem = None
+        self.is_use_snn_residual = is_use_snn_residual
+
+    def forward(self, input_):
+        with torch.no_grad():
+            # 计算前后相邻图像的差值
+            prev_imgs = input_[:, :-1, ...]  # 前 N-1 张图像 [B, N-1, C, H, W]
+            next_imgs = input_[:, 1:, ...]  # 后 N-1 张图像 [B, N-1, C, H, W]
+            f_error = torch.sigmoid(next_imgs - prev_imgs)  # 残差张量 [B, N-1, C, H, W]
+            b_error = torch.sigmoid(prev_imgs - next_imgs)
+            if self.is_use_snn_residual:
+                f_error = self.LIF(f_error)
+                b_error = self.LIF(b_error)
+
+            error = torch.cat([f_error, b_error], dim=2)
+
+        return error
+
+    def LIF(self, input_):
+        if self.mem is None:
+            self.mem = torch.zeros(input_.shape).to(input_.device)  # 初始化膜电位
+
+        self.mem += input_  # 累积输入
+        spikes = (self.mem > self.threshold).float()  # 发放脉冲
+        self.mem -= self.threshold * spikes  # 重置膜电位
+        return spikes
+
+
+class DrawLastFrameFeature(nn.Module):
+    def __init__(self, in_channels=9, out_channels=150, config=None):
+        super(DrawLastFrameFeature, self).__init__()
+        self.conv2d_1 = nn.Conv2d(
+            in_channels, 36, (5, 5), stride=(2, 2), padding=(2, 2), bias=True
+        )
+        self.batchnorm_1 = nn.BatchNorm2d(36)
+        self.conv2d_2 = nn.Conv2d(
+            36, 72, (3, 3), stride=(1, 1), padding=(1, 1), bias=True
+        )
+        self.batchnorm_2 = nn.BatchNorm2d(72)
+        self.conv2d_3 = nn.Conv2d(
+            72, out_channels, (3, 3), stride=(1, 1), padding=(1, 1), bias=True
+        )
+        self.batchnorm_3 = nn.BatchNorm2d(out_channels)
+        self.flatten = nn.Flatten(start_dim=2)
+        if config.data_format == "rpy":
+            self.fc = nn.Linear(49, 4, bias=True)
+        elif config.data_format == "joints":
+            self.fc = nn.Linear(49, config.action_dim, bias=True)
+
+        self.norm_ = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, error):
+        x = torch.cat([x, error], dim=1)
+        x = soft_pool2d(self.batchnorm_1(self.conv2d_1(x)))
+        x = self.relu(x)
+        x = soft_pool2d(self.batchnorm_2(self.conv2d_2(x)))
+        x = self.relu(x)
+        x = soft_pool2d(self.batchnorm_3(self.conv2d_3(x)))
+        x = self.relu(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        x = self.norm_(x)
+        return x
+
+
+class ImageDiffusion:
+    def __init__(self) -> Unet:
+        unet_enc = Unet(
+            dim=8,  # 基础维度保持不变
+            channels=3,  # 修改为输入的通道数
+            dim_mults=(1, 2),  # 根据输入的形状适配下采样的次数
+        )
+        # 修改 GaussianDiffusion 的参数
+        self.diff_enc = GaussianDiffusion(
+            unet_enc,
+            image_size=(20, 32),  # 匹配输入的图像大小，需要能被2整除
+            timesteps=100,  # 时间步长保持不变
+            sampling_timesteps=100,  # 保持采样步长
+        )
+        return unet_enc
+
+
+class CrossConvolution(nn.Module):
+    def __init__(self, z_dim=128, in_channels=3, out_channels=1):
+        super(CrossConvolution, self).__init__()
+        # self.img_tac_conv = nn.Conv1d(in_channels - 1, out_channels, kernel_size=3, padding=1)
+        # self.flex_conv = nn.Conv1d(in_channels - 1, out_channels, kernel_size=3, padding=1)
+        self.cross_conv1d = nn.Conv1d(
+            in_channels, out_channels, kernel_size=3, padding=1
+        )
+        self.leakyrelu = nn.LeakyReLU(0.1, inplace=True)
+
+    def forward(self, multimodal_dat):
+        return self.leakyrelu(self.cross_conv1d(multimodal_dat))
+
+
+class SelfAttentions(nn.Module):
+    def __init__(self, input_dim=256, seq_len=70, eq_output=False):
+        """
+        Self attentions moudule
+        param:
+        input_dim: int
+        seq_len: int
+        eq_output: bool, is output dim eq for input dim
+        """
+        super(SelfAttentions, self).__init__()
+        self.fc = nn.Linear(input_dim, input_dim)
+        self.normal_modal = nn.BatchNorm1d(num_features=seq_len)
+        if eq_output:
+            self.fc_out = nn.Linear(input_dim, input_dim)
+        else:
+            self.fc_out = nn.Linear(input_dim, input_dim // 2)
+
+    def forward(self, mu, var=None):
+        if mu is not None and var is not None:
+            x = torch.cat([mu, var], dim=-1)
+        else:
+            x = mu
+        norm_out = self.normal_modal(x)
+        x = self.fc(norm_out)
+        attention_weights = F.softmax(x, dim=1)  ##
+
+        attended_modalities = torch.mul(attention_weights, norm_out)
+        attended_modalities = torch.add(attended_modalities, norm_out)
+        out = self.fc_out(attended_modalities)
+
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, head, dim, output_dim) -> None:
+        super(MultiHeadAttention, self).__init__()
+
+        self.head = head
+        self.dk = dim // head
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.softmax = nn.Softmax(dim=-1)
+        self.o = nn.Linear(dim, output_dim)
+
+    def forward(self, x):
+        B, S, C = x.shape
+        q = self.q(x).view(B, S, self.head, self.dk).transpose(1, 2)
+        k = self.k(x).view(B, S, self.head, self.dk).transpose(1, 2)
+        v = self.v(x).view(B, S, self.head, self.dk).transpose(1, 2)
+        qk = torch.matmul(q, k.transpose(-2, -1))
+        scores = qk / math.sqrt(self.dk)
+        attention_weights = self.softmax(scores)
+        attended_modalities = torch.matmul(attention_weights, v)
+        attended_modalities = (
+            attended_modalities.transpose(1, 2).contiguous().view(B, S, -1)
+        )
+        attended_modalities = self.o(attended_modalities)
+
+        return attended_modalities
+
+
+class MultiModalAttention(nn.Module):
+    def __init__(self, z_dim=128, num_modalities=3, xlstm_cfg=None, use_language=False):
+        super(MultiModalAttention, self).__init__()
+        self.num_modalities = num_modalities
+        self.z_dim = z_dim
+        self.use_language = use_language
+
+        # Calculate input dimension based on modality feature dimension
+        # Each modality outputs [B, S, enc_out_dim*2] after processing
+        # fc acts on the feature dimension (last dim), which is enc_out_dim * 2
+        feature_dim = xlstm_cfg.enc_out_dim * 2
+
+        if (
+            xlstm_cfg.both_camera_concat_over == "c_channel"
+            and xlstm_cfg.act_encoder == "causalconv"
+        ):
+            self.fc = nn.Linear(112, 1)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "transformerxlstm"
+        ):
+            self.fc = nn.Linear(feature_dim, 1)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "causalconv"
+        ):
+            self.fc = nn.Linear(16384, 1)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "xlstm"
+        ):
+            self.fc = nn.Linear(feature_dim, 1)
+        else:
+            raise ValueError("keyword error")
+
+    def forward(self, modalities):
+        # Compute attention weights
+        attention_weights = F.softmax(self.fc(modalities), dim=1)
+        attended_modalities = torch.mul(attention_weights, modalities)
+
+        return attended_modalities
+
+
+class MultiModalFusionModel(nn.Module):
+    def __init__(
+        self,
+        num_modalities=3,
+        z_dim=256,
+        embedding_dim=256,
+        is_use_cross_conv=True,
+        xlstm_cfg=None,
+        use_language=False,
+    ):
+        super(MultiModalFusionModel, self).__init__()
+        self.num_modalities = num_modalities
+        self.z_dim = z_dim * 2  # need to split mu&var, so * 2
+        self.is_use_cross_conv = is_use_cross_conv
+        self.embedding_dim = embedding_dim
+        self.use_language = use_language
+
+        # Calculate modalities_seq_dim (number of sequence positions after concat on dim=1)
+        # Visual modalities: each has [B, 120, 240] = [B, seq_len, features]
+        # Action modality: [B, 120, 240]
+        # Language modality: [B, 1, 240] (single token after projection)
+        if use_language:
+            # Language adds 1 sequence position, not enc_out_dim positions
+            language_seq_len = 1
+            modalities_seq_dim = (
+                xlstm_cfg.model.embedding_dim * 2  # 120 * 2 = 240 from visual
+                + xlstm_cfg.act_model_enc.embedding_dim  # 120 from action
+                + language_seq_len  # 1 from language
+            )
+        else:
+            modalities_seq_dim = (
+                xlstm_cfg.model.embedding_dim * 2
+                + xlstm_cfg.act_model_enc.embedding_dim
+            )
+
+        self.fusion_model = CrossConvolution(
+            in_channels=modalities_seq_dim, out_channels=embedding_dim, z_dim=self.z_dim
+        )
+        # Define multi-modal attention
+        self.attention = MultiModalAttention(
+            num_modalities=num_modalities,
+            z_dim=self.embedding_dim,
+            xlstm_cfg=xlstm_cfg,
+            use_language=use_language,
+        )
+        self.normal_modal = nn.BatchNorm1d(num_features=self.embedding_dim)
+        self.leakyrelu = nn.LeakyReLU(0.1, inplace=True)
+        self.flatten = nn.Flatten()
+        # Fully connected layers
+        if xlstm_cfg.both_camera_concat_over == "c_channel":
+            self.fc1 = nn.Linear(112, self.z_dim)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "causalconv"
+        ):
+            self.fc1 = nn.Linear(16384, self.z_dim)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "transformerxlstm"
+        ):
+            self.fc1 = nn.Linear(xlstm_cfg.enc_out_dim * 2, self.z_dim)
+        elif (
+            xlstm_cfg.both_camera_concat_over == "w_channel"
+            and xlstm_cfg.act_encoder == "xlstm"
+        ):
+            self.fc1 = nn.Linear(xlstm_cfg.enc_out_dim * 2, self.z_dim)
+        else:
+            raise ValueError("keyword error")
+
+    def forward(self, modalities):
+        """
+        Param:
+        modaltities:[
+            [B, S, ...],
+            ...
+            ]
+        """
+        # modalities: [visal, act]
+
+        modality_outputs = torch.cat(modalities, dim=1)
+        batch_size, num_modal, num_features = modality_outputs.size()
+        normal_result = F.normalize(modality_outputs, dim=1)
+        # Apply multi-modal attention
+        attention_result = self.attention(normal_result)
+        sum_result = torch.add(normal_result, attention_result)
+        if self.is_use_cross_conv:
+            fused_result = self.fusion_model(sum_result)
+        else:
+            fused_result = sum_result
+        # sum_fused_result = torch.sum(fused_result, dim=1)
+        # flatten_result = self.flatten(fused_result.squeeze(-1).squeeze(-1))
+        fused_result = fused_result.squeeze(-1).squeeze(-1)
+        fc_out = self.fc1(fused_result)
+
+        return fc_out
+
+
+class CausalNet(nn.Module):
+    def __init__(self, z_dim=256, num_img=12, initailize_weights=True, xlstm_cfg=None):
+        super(CausalNet, self).__init__()
+        self.z_dim = z_dim
+        self.num_img = num_img
+        in_channels = xlstm_cfg.past_img_num + xlstm_cfg.future_img_num
+        self.causconv1 = CausalConv2D(
+            in_channels, 32, kernel_size=(3, 3), stride=1, dilation=1
+        )
+        self.causconv2 = CausalConv2D(32, 64, kernel_size=(3, 3), stride=1, dilation=1)
+        self.causconv3 = CausalConv2D(64, 64, kernel_size=(3, 3), stride=1, dilation=1)
+        self.causconv4 = CausalConv2D(64, 128, kernel_size=(3, 3), stride=1, dilation=1)
+        self.causconv5 = CausalConv2D(
+            128, z_dim, kernel_size=(3, 3), stride=1, dilation=1
+        )
+
+        self.flatten = nn.Flatten()
+
+    def forward(self, tactile):
+        leaky_result1, causconv1_result1 = self.causconv1(tactile)
+        leaky_result2, causconv1_result2 = self.causconv2(leaky_result1)
+        leaky_result3, causconv1_result3 = self.causconv3(leaky_result2)
+        leaky_result4, causconv1_result4 = self.causconv4(leaky_result3)
+        leaky_result5, causconv1_result5 = self.causconv5(leaky_result4)
+
+        return leaky_result5
+
+
+class TransformerXLSTM(nn.Module):
+    def __init__(
+        self,
+        input_channels=11,
+        embed_dim=240,
+        hidden_dim=128,
+        num_layers=6,
+        num_heads=10,
+        output_dim=16,
+        max_history=5,
+        config=None,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_history = max_history
+        self.config = config
+        device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+        if not config.is_only_transformer:
+            self._xlstm = XLstmStack(self.config.act_model_enc, device=device)
+        else:
+            num_layers = num_layers + config.act_model_enc.num_blocks
+        self.input_proj = nn.Linear(input_channels, embed_dim)
+
+        # Transformer Encoder (调整d_model为embed_dim)
+        self.transformer_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.transformer_encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.down_conv = nn.Conv1d(
+            config.act_model_enc.context_length,
+            config.act_model_enc.embedding_dim,
+            kernel_size=3,
+            padding=1,
+        )
+
+        # BiLSTM (调整输入维度)
+        # self.bilstm = nn.LSTM(
+        #     input_size=embed_dim,
+        #     hidden_size=hidden_dim,
+        #     num_layers=num_layers//2,  # 双向需减半层数
+        #     bidirectional=True,
+        #     batch_first=True
+        # )
+
+        self.norm_ = nn.BatchNorm1d(hidden_dim)
+        # 输出层
+        self.fc = nn.Linear(
+            config.act_model_enc.embedding_dim, output_dim, bias=True
+        )  # 双向输出合并
+        self.norm_2 = nn.BatchNorm1d(config.act_model_enc.context_length)
+
+    def forward(self, x):
+        """
+        输入x: (batch_size, seq_len, input_channels)
+        lengths: 实际有效序列长度（用于动态处理）
+        """
+        # 1. 输入投影
+        x = self.input_proj(x)  # (B, S, embed_dim)
+        if not self.config.is_only_transformer:
+            x = self._xlstm.xlstm(x)
+        x = self.norm_2(x)
+        out = self.transformer_encoder(x)  # (B, S, embed_dim)
+        out = self.norm_(out)
+        out = self.down_conv(out)
+
+        return self.fc(out)
+
+
+class DownConv(nn.Module):
+    def __init__(self, embedding_dim, enc_out_dim, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.conv_seq = nn.Sequential(
+            nn.Conv3d(
+                embedding_dim,
+                embedding_dim * 2,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+            ),
+            nn.BatchNorm3d(embedding_dim * 2),
+            nn.ReLU(),
+            nn.Conv3d(
+                embedding_dim * 2,
+                enc_out_dim,
+                kernel_size=(3, 3, 3),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1),
+            ),
+            nn.BatchNorm3d(enc_out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.conv_seq(x)
+
+
+class ConvLstmEnc(nn.Module):
+    def __init__(self, input_channels=64, output_channel=128) -> None:
+        super(ConvLstmEnc, self).__init__()
+        self.conv_lstm1 = ConvLSTM(
+            input_channels=input_channels,
+            hidden_channels=64,
+            num_layers=1,
+            first_flag=True,
+        )
+        self.conv_lstm2 = ConvLSTM(
+            input_channels=64,
+            hidden_channels=128,
+            num_layers=1,
+            stride=2,
+            size_flag="up",
+        )
+        self.conv_lstm3 = ConvLSTM(
+            input_channels=128, hidden_channels=output_channel, num_layers=1
+        )
+
+    def forward(self, x):
+        h, c = self.conv_lstm1(x)
+        h, c = self.conv_lstm2(h, c)
+        h, c = self.conv_lstm3(h, c)
+        return self.frame_to_stream(h)
+
+    def frame_to_stream(self, in_list):
+        temp_state = [temp.unsqueeze(2) for temp in in_list]
+        cat_result = torch.cat(temp_state, dim=2)
+        return cat_result
+
+
+def get_images_error(last_frame: torch.Tensor, curr_frame: torch.Tensor, seq: int):
+    error_pred_label = F.sigmoid(last_frame - curr_frame)
+    error_label_pred = F.sigmoid(curr_frame - last_frame)
+    error_all = torch.cat([error_label_pred, error_pred_label], dim=2)
+    # img_show(last_frame[-1][-1], error_pred_label[-1][-1], error_label_pred[-1][-1])
+    return error_all
+
+
+from matplotlib import pyplot as plt
+import numpy as np
+
+
+def img_show(*images):
+    """
+    显示多个RGB张量的图片
+
+    参数:
+    *images: 任意数量的RGB张量
+    格式：
+    必须是[channel, h, w]或者[channel, num_img, h, w]
+    不带batchsize
+    """
+    num_images = len(images)
+    if num_images <= 1:
+        images = images[0]
+        num_images = images.shape[1]
+
+    # 设置子图的行和列
+    rows = 1
+    cols = num_images
+
+    # 创建一个新的图形
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5))
+
+    # 如果只有一张图片，将axes转换为一个包含单个元素的列表
+    if num_images == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        # 将RGB张量的值限制在0到1之间
+        if num_images <= 1:
+            image_data = np.clip(
+                images[i].permute(1, 2, 0).detach().cpu().numpy(), 0, 1
+            )
+        else:
+            if images[i].size(0) == 3:
+                image_data = np.clip(
+                    images[i][:, :, :].permute(1, 2, 0).detach().cpu().numpy(), 0, 1
+                )
+            elif images[i].size(0) >= 3 and images[i].size(0) % 3 == 0:
+                img = torch.cat(torch.split(images[i], 3), dim=1)
+                image_data = np.clip(img.permute(1, 2, 0).detach().cpu().numpy(), 0, 1)
+
+        # 显示图片
+        ax.imshow(image_data)
+        ax.axis("off")
+
+    plt.show()
