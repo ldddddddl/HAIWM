@@ -328,6 +328,107 @@ class LanguageConditionedFusion(nn.Module):
         return features
 
 
+class OneHotLanguageEncoder(nn.Module):
+    """
+    One-Hot Task ID Encoder for Ablation Study.
+
+    This encoder uses a simple task ID lookup instead of semantic CLIP embeddings.
+    It's used to compare against CLIP encoding to demonstrate the benefit of
+    pre-trained language understanding.
+
+    Args:
+        num_tasks: Number of unique tasks (default: 10 for libero_10)
+        output_dim: Output dimension to match CLIP encoder
+        embed_dim: Hidden embedding dimension
+    """
+
+    def __init__(
+        self,
+        num_tasks: int = 10,
+        output_dim: int = 120,
+        embed_dim: int = 256,
+        device: Optional[str] = None,
+    ):
+        super().__init__()
+
+        self.num_tasks = num_tasks
+        self.output_dim = output_dim
+        self.embed_dim = embed_dim
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Task ID embedding
+        self.embedding = nn.Embedding(num_tasks, embed_dim)
+
+        # Projection to output dimension
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+        # Task name to ID mapping (built during training)
+        self.task_to_id = {}
+        self._next_task_id = 0
+
+    def _get_task_id(self, task_name: str) -> int:
+        """Get or assign task ID for a task name."""
+        if task_name not in self.task_to_id:
+            if self._next_task_id >= self.num_tasks:
+                # Hash to a valid ID if we exceed num_tasks
+                task_id = hash(task_name) % self.num_tasks
+            else:
+                task_id = self._next_task_id
+                self._next_task_id += 1
+            self.task_to_id[task_name] = task_id
+        return self.task_to_id[task_name]
+
+    def forward(
+        self,
+        texts: Union[str, List[str]],
+        use_cache: bool = True,  # Kept for API compatibility
+    ) -> torch.Tensor:
+        """
+        Encode task names to one-hot based embeddings.
+
+        Args:
+            texts: Single text or list of task descriptions
+            use_cache: Ignored, kept for API compatibility
+
+        Returns:
+            Tensor of shape [batch_size, output_dim]
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        # Convert texts to task IDs
+        task_ids = []
+        for text in texts:
+            task_id = self._get_task_id(text)
+            task_ids.append(task_id)
+
+        # Create tensor
+        task_ids = torch.tensor(task_ids, device=self.device, dtype=torch.long)
+
+        # Get embeddings
+        embeddings = self.embedding(task_ids)  # [B, embed_dim]
+
+        # Project to output dimension
+        output = self.projection(embeddings)  # [B, output_dim]
+
+        return output
+
+    def clear_cache(self):
+        """Clear task mapping (for API compatibility)."""
+        pass
+
+    @property
+    def requires_grad(self) -> bool:
+        """This encoder is always trainable."""
+        return True
+
+
 # ============================================================================
 # Test
 # ============================================================================

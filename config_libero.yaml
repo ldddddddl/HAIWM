@@ -36,6 +36,7 @@ task_suite: libero_10  # libero_10, libero_90, libero_spatial, libero_object, li
 
 # Language modality settings
 use_language: True
+language_encoder_type: "clip"  # Options: "clip" or "onehot" (for ablation study)
 clip_model: "ViT-B/32"
 clip_embed_dim: 512
 language_output_dim: 120  # Project CLIP embedding to match other modalities
@@ -59,7 +60,8 @@ alpha_loss:
     kl: 500.0
     actions: 2500.0
     frames: 6.0
-    gripper: 500.0  # renamed from sucker for LIBERO
+    sucker: 500.0  # End-effector gripper/sucker action loss weight
+    gripper: 500.0  # Alias for sucker (LIBERO compatibility)
     gdl: 0.001
 
 critic:

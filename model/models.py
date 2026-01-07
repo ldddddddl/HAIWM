@@ -60,15 +60,34 @@ class ActNet(nn.Module):
         # Language encoder for LIBERO
         self.use_language = getattr(xlstm_cfg, "use_language", False)
         if self.use_language and HAS_LANGUAGE_ENCODER:
+            language_encoder_type = getattr(xlstm_cfg, "language_encoder_type", "clip")
             clip_model = getattr(xlstm_cfg, "clip_model", "ViT-B/32")
             language_output_dim = getattr(
                 xlstm_cfg, "language_output_dim", xlstm_cfg.model.embedding_dim
             )
-            self.language_encoder = CLIPLanguageEncoder(
-                clip_model=clip_model,
-                output_dim=language_output_dim,
-                device=device if device != "vanilla" else "cpu",
-            )
+
+            if language_encoder_type == "onehot":
+                # Use One-Hot encoding for ablation study
+                from model.language_encoder import OneHotLanguageEncoder
+
+                num_tasks = getattr(xlstm_cfg, "num_tasks", 10)  # Default for libero_10
+                self.language_encoder = OneHotLanguageEncoder(
+                    num_tasks=num_tasks,
+                    output_dim=language_output_dim,
+                    device=device if device != "vanilla" else "cpu",
+                )
+                print(
+                    f"[ActNet] Using One-Hot Language Encoder (num_tasks={num_tasks})"
+                )
+            else:
+                # Use CLIP encoding (default)
+                self.language_encoder = CLIPLanguageEncoder(
+                    clip_model=clip_model,
+                    output_dim=language_output_dim,
+                    device=device if device != "vanilla" else "cpu",
+                )
+                print(f"[ActNet] Using CLIP Language Encoder ({clip_model})")
+
             # Projection layer to match language dim to visual/action feature dim
             self.language_proj = nn.Linear(language_output_dim, self.enc_out_dim)
             # Update modalities_seq_dim: language adds 1 sequence position (not enc_out_dim)
@@ -480,7 +499,11 @@ class ActNet(nn.Module):
                     # Expand to match other modality dimensions [B, 1, enc_out_dim]
                     lang_embedding = lang_embedding.unsqueeze(1)
                     modalities_list.append(lang_embedding)
-                fused_modal = self.modal_fusion_model(modalities_list)
+                # Get attention weights for visualization
+                fused_modal, attn_weights = self.modal_fusion_model(
+                    modalities_list, return_attention=True
+                )
+                self.output.attention_weights = attn_weights
             else:
                 grip_out_temp = torch.flatten(grip_visual_out, start_dim=2)
                 side_out_temp = torch.flatten(side_visual_out, start_dim=2)
@@ -514,11 +537,8 @@ class ActNet(nn.Module):
                 SelfAttentions=self.self_attentions,
                 training_phase=phase,
             )
-            # visualize z
-
-            # zt = torch.cat([torch.flatten(grip_visual_out, start_dim=2), torch.flatten(side_visual_out, start_dim=2), act_out], dim=-1)
-            # visualize_fn(fused_modal, n_components=2)
-            # visualize_fn(z_mix, n_components=2)
+            # Save z_mix for t-SNE visualization
+            self.output.z_mix = z_mix
 
             ### actions
             if ith < self.xlstm_cfg.future_img_num:
@@ -814,11 +834,13 @@ class MultiModalAttention(nn.Module):
         else:
             raise ValueError("keyword error")
 
-    def forward(self, modalities):
+    def forward(self, modalities, return_weights=False):
         # Compute attention weights
         attention_weights = F.softmax(self.fc(modalities), dim=1)
         attended_modalities = torch.mul(attention_weights, modalities)
 
+        if return_weights:
+            return attended_modalities, attention_weights
         return attended_modalities
 
 
@@ -891,13 +913,14 @@ class MultiModalFusionModel(nn.Module):
         else:
             raise ValueError("keyword error")
 
-    def forward(self, modalities):
+    def forward(self, modalities, return_attention=False):
         """
         Param:
         modaltities:[
             [B, S, ...],
             ...
             ]
+        return_attention: If True, also return attention weights for visualization
         """
         # modalities: [visal, act]
 
@@ -905,7 +928,13 @@ class MultiModalFusionModel(nn.Module):
         batch_size, num_modal, num_features = modality_outputs.size()
         normal_result = F.normalize(modality_outputs, dim=1)
         # Apply multi-modal attention
-        attention_result = self.attention(normal_result)
+        if return_attention:
+            attention_result, attention_weights = self.attention(
+                normal_result, return_weights=True
+            )
+        else:
+            attention_result = self.attention(normal_result)
+            attention_weights = None
         sum_result = torch.add(normal_result, attention_result)
         if self.is_use_cross_conv:
             fused_result = self.fusion_model(sum_result)
@@ -916,6 +945,8 @@ class MultiModalFusionModel(nn.Module):
         fused_result = fused_result.squeeze(-1).squeeze(-1)
         fc_out = self.fc1(fused_result)
 
+        if return_attention:
+            return fc_out, attention_weights
         return fc_out
 
 

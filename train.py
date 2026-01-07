@@ -32,6 +32,7 @@ from script.metrics import calc_metrics
 from load_jetmax_dataset import load_lerobot_dataloader
 import ctypes
 from accelerate.utils import send_to_device
+from tqdm import tqdm
 
 
 def main(xlstm_cfg: DictConfig):
@@ -170,11 +171,18 @@ def main(xlstm_cfg: DictConfig):
         arr_act_mse_list = np.array(best_results.action_mse_list)
         best_results.act_std = arr_act_mse_list.std(ddof=0)
         best_results.act_var = arr_act_mse_list.var(ddof=0)
-        best_results.act_sem = stats.sem(arr_act_mse_list, ddof=0)
+        # Avoid SmallSampleWarning: need at least 2 samples for sem
+        if len(arr_act_mse_list) >= 2:
+            best_results.act_sem = stats.sem(arr_act_mse_list, ddof=0)
+        else:
+            best_results.act_sem = 0.0
         arr_critic_mse_list = np.array(best_results.critic_mse_list)
         best_results.critic_std = arr_critic_mse_list.std(ddof=0)
         best_results.critic_var = arr_critic_mse_list.var(ddof=0)
-        best_results.critic_sem = stats.sem(arr_critic_mse_list, ddof=0)
+        if len(arr_critic_mse_list) >= 2:
+            best_results.critic_sem = stats.sem(arr_critic_mse_list, ddof=0)
+        else:
+            best_results.critic_sem = 0.0
 
         results_dict[f"epoch_{epc + 1}"] = {
             "train_actions_loss": train_avg.actions_loss.avg,
@@ -351,7 +359,10 @@ def train(
     timestamp = 0
     model.train()
 
-    for batch_idx, batch in enumerate(dataloader):
+    pbar = tqdm(
+        dataloader, desc=f"Train Epoch {epc + 1}/{xlstm_cfg.epochs}", leave=False
+    )
+    for batch_idx, batch in enumerate(pbar):
         # labels include: [sucker, joints_pos, gripper_frame, side_frame, joints_pos_with_timestamp]
 
         if xlstm_cfg.snn.is_use:
@@ -397,7 +408,7 @@ def train(
                 torch.zeros(output.sucker.size(0), dtype=torch.long).cpu().data.numpy()
             )
 
-        acc_sucker = sum(
+        acc_gripper = sum(
             accuracy_score(
                 pred_sucker[h].cpu().data.numpy(),
                 sucker_labels,
@@ -408,18 +419,20 @@ def train(
         # pred_sucker = [torch.max(output.sucker[:, d, :], 1)[1] for d in range(xlstm_cfg.frames_seq)]
 
         # acc_sucker =  sum(accuracy_score(pred_sucker[d].cpu().data.numpy(), labels[0][:, d].data.numpy()) for d in range(xlstm_cfg.frames_seq)) / xlstm_cfg.frames_seq
-        train_avg.sucker_pred_acc.update(acc_sucker)
+        train_avg.sucker_pred_acc.update(acc_gripper)
 
         optimizer.zero_grad(set_to_none=True)
         loss_results.losses.backward()
         optimizer.step()
         _run_time = time.time() - _time
 
-        print(
-            f"\tPhase: training | Epc: {epc}/{xlstm_cfg.epochs} Total: {batch_idx}/{len(dataloader)} | losses: {loss_results.losses.item():.2f} | sucker_acc: {acc_sucker:.4f} | training time: {_run_time:.4f}",
-            end="\r",
+        # Update progress bar with metrics
+        pbar.set_postfix(
+            loss=f"{loss_results.losses.item():.2f}",
+            gripper_acc=f"{acc_gripper:.4f}",
+            time=f"{_run_time:.4f}",
         )
-        break
+        # break
     return loss_results
 
 
@@ -451,7 +464,13 @@ def valid(
     data_count = max(1, len(dataloader) // full_data_len)
     index = epc % data_count
     with torch.no_grad():
-        for batch_idx, batch_data in enumerate(dataloader):
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            desc=f"Valid Epoch {epc + 1}/{xlstm_cfg.epochs}",
+            leave=False,
+        )
+        for batch_idx, batch_data in pbar:
             # Check if batch is in LIBERO dict format or JetMax tuple format
             if isinstance(batch_data, dict):
                 # LIBERO batch dict format
@@ -474,14 +493,16 @@ def valid(
                 best_results.action_mse_list.append(loss_results.actions_loss)
                 best_results.critic_mse_list.append(loss_results.critic_loss)
 
-                # compute acc - use placeholder for LIBERO (no sucker_action)
-                pred_sucker = torch.argmax(output.sucker, dim=-1)
-                sucker_labels = torch.zeros(
+                # compute acc - use placeholder for LIBERO (no gripper_action in labels)
+                pred_gripper = torch.argmax(output.sucker, dim=-1)
+                gripper_labels = torch.zeros(
                     output.sucker.size(0), dtype=torch.long, device=device
                 )
-                acc_sucker = 0.5  # Placeholder accuracy for LIBERO
+                acc_gripper = 0.5  # Placeholder accuracy for LIBERO
+                # Update F1 metrics for LIBERO
+                f1_metrix.update(pred_gripper[:, -1], gripper_labels)
 
-                valid_avg.sucker_pred_acc.update(acc_sucker)
+                valid_avg.sucker_pred_acc.update(acc_gripper)
                 valid_avg.infer_time.update(run_time)
 
                 # Collect predictions for metrics
@@ -502,13 +523,15 @@ def valid(
                     else batch["action"]
                 )
 
-                print(
-                    f"\tPhase: valid | Epc: {epc}/{xlstm_cfg.epochs} | Total: {batch_idx}/{len(dataloader)} | losses: {loss_results.losses.item():.2f} | sucker_acc: {acc_sucker:.4f} | inference_time: {run_time:.4f}",
-                    end="\r",
+                # Update progress bar with metrics
+                pbar.set_postfix(
+                    loss=f"{loss_results.losses.item():.2f}",
+                    gripper_acc=f"{acc_gripper:.4f}",
+                    time=f"{run_time:.4f}",
                 )
 
                 # Break after first batch for validation (similar to training)
-                break
+                # break
             else:
                 # JetMax tuple format: (timestamp_motors_sucker, gripper_frame_timestamp, side_frame_timestamp, labels)
                 (
@@ -558,17 +581,17 @@ def valid(
                 best_results.action_mse_list.append(loss_results.actions_loss)
                 best_results.critic_mse_list.append(loss_results.critic_loss)
 
-                # compute acc
-                pred_sucker = torch.argmax(output.sucker, dim=-1)
-                f1_metrix.update(pred_sucker[-1], labels[0][-1])
-                acc_sucker = sum(
+                # compute gripper action classification accuracy
+                pred_gripper = torch.argmax(output.sucker, dim=-1)
+                f1_metrix.update(pred_gripper[-1], labels[0][-1])
+                acc_gripper = sum(
                     accuracy_score(
-                        pred_sucker[:, h].cpu().data.numpy(),
+                        pred_gripper[:, h].cpu().data.numpy(),
                         labels[0][:, h].cpu().data.numpy(),
                     )
                     for h in range(output.sucker.size(1))
                 ) / (output.sucker.size(1))
-                valid_avg.sucker_pred_acc.update(acc_sucker)
+                valid_avg.sucker_pred_acc.update(acc_gripper)
                 valid_avg.infer_time.update(run_time)
                 if batch_idx in range(
                     (index) * full_data_len, (index + 1) * full_data_len
@@ -613,9 +636,11 @@ def valid(
                         label_grip_images.append(labels[2][-1])
                         label_side_images.append(labels[3][-1])
 
-                print(
-                    f"\tPhase: valid | Epc: {epc}/{xlstm_cfg.epochs} | Total: {batch_idx}/{len(dataloader)} | losses: {loss_results.losses.item():.2f} | sucker_acc: {acc_sucker:.4f} | inference_time: {run_time:.4f}",
-                    end="\r",
+                # Update progress bar with metrics
+                pbar.set_postfix(
+                    loss=f"{loss_results.losses.item():.2f}",
+                    gripper_acc=f"{acc_gripper:.4f}",
+                    time=f"{run_time:.4f}",
                 )
 
         # if len(pred_action) == 1:
