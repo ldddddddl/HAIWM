@@ -3,10 +3,10 @@ state: training
 epochs: 200
 lr: 3.0e-5
 batchsize: 8
-datasets_path: ./datasets/libero/libero_10
-results_path: results/
+datasets_path: /data1/donglingliu/libero/libero_10
+results_path: /data1/donglingliu/results
 data_format: joints
-is_init_param: False
+is_init_param: True 
 is_resume: False
 checkpoint_path: ""
 past_img_num: 5
@@ -29,6 +29,7 @@ per_episode_to_batch_num: 2
 enc_out_dim: 120
 both_camera_concat_over: w_channel
 is_use_cdna: True
+model_save_interval: 50
 
 # LIBERO specific settings
 use_libero: True
@@ -57,12 +58,12 @@ alpha_loss:
     pos: 0.5
     vel: 0.3
     eff: 0.2 
-    kl: 500.0
-    actions: 2500.0
-    frames: 6.0
-    sucker: 500.0  # End-effector gripper/sucker action loss weight
-    gripper: 500.0  # Alias for sucker (LIBERO compatibility)
-    gdl: 0.001
+    kl: 1.0
+    actions: 1.0
+    frames: 1.0
+    sucker: 1.0  # End-effector gripper/sucker action loss weight
+    gripper: 1.0  # Alias for sucker (LIBERO compatibility)
+    gdl: 1.0
 
 critic:
     num_heads: 4
@@ -138,5 +139,5 @@ wandb_entity: null  # 可选，设置为您的wandb用户名或团队名
 wandb_run_name: null  # 可选，默认使用时间戳
 
 # Multi-GPU (DDP) training configuration
-use_ddp: False  # 是否启用多卡训练
+use_ddp: True  # 是否启用多卡训练
 local_rank: -1  # 由启动脚本自动设置

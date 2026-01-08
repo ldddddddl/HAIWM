@@ -9,13 +9,13 @@ import time
 from argparse import ArgumentParser
 from omegaconf import DictConfig, OmegaConf
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from losses import ComputeLosses
 from sklearn.metrics import accuracy_score
 from misc import (
     InitAverager,
     set_seed,
     save_images,
-    save_checkpoint,
     VariableContainer,
     SegmentBuffer,
     TorchMetricsWrapper,
@@ -47,9 +47,12 @@ except ImportError:
 
 def setup_ddp():
     """初始化分布式训练环境"""
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    # 显式传入device_id以避免PyTorch警告
+    dist.init_process_group(
+        backend="nccl", device_id=torch.device(f"cuda:{local_rank}")
+    )
     return local_rank
 
 
@@ -96,6 +99,10 @@ def main(xlstm_cfg: DictConfig):
     optimizer = optim.Adam(
         params=model.parameters(), lr=xlstm_cfg.lr, betas=[0.9, 0.99], weight_decay=1e-4
     )
+    # 创建余弦退火学习率调度器
+    # eta_min: 最小学习率，默认为初始学习率的1%
+    min_lr = getattr(xlstm_cfg, "min_lr", xlstm_cfg.lr * 0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=xlstm_cfg.epochs, eta_min=min_lr)
     if xlstm_cfg.is_resume:
         checkpoint = torch.load(xlstm_cfg.checkpoint_path, map_location=device)
         # Handle DDP wrapped model checkpoint
@@ -106,6 +113,9 @@ def main(xlstm_cfg: DictConfig):
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # 恢复学习率调度器状态
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
     else:
         model.apply(init_weights)
 
@@ -119,6 +129,9 @@ def main(xlstm_cfg: DictConfig):
             output_device=local_rank,
             find_unused_parameters=True,
         )
+        # _set_static_graph() is needed because some parameters are reused
+        # (e.g., critic.bias_fc.bias) which causes DDP gradient sync issues
+        model._set_static_graph()
 
     writer = ""
 
@@ -202,9 +215,27 @@ def main(xlstm_cfg: DictConfig):
     grip_upsample_frame_pred_temp, grip_frame_labels_temp = None, None
     side_upsample_frame_pred_temp, side_frame_labels_temp = None, None
 
+    # ===================== Checkpoint 保存设置 =====================
+    # 最佳验证损失（用于保存最佳模型）
+    best_valid_loss = float("inf")
+    # 保存间隔（每隔多少个epoch保存一次，默认10）
+    save_interval = getattr(xlstm_cfg, "save_interval", xlstm_cfg.model_save_interval)
+    # 是否保存最佳模型（默认True）
+    save_best = getattr(xlstm_cfg, "save_best", xlstm_cfg.model_save_interval > 0)
+    checkpoint_dir = os.path.join(
+        pwd, xlstm_cfg.results_path, formatted_datetime, "check_point"
+    )
+
     for epc in range(xlstm_cfg.epochs):
         train_avg = InitAverager()
         valid_avg = InitAverager()
+
+        # 打印当前学习率（仅主进程）
+        if is_main_process():
+            current_lr = scheduler.get_last_lr()[0]
+            print(
+                f"Epoch {epc + 1}/{xlstm_cfg.epochs} - Learning Rate: {current_lr:.2e}"
+            )
 
         train_phase = ""
         use_tired_training = xlstm_cfg.is_use_three_phase_train
@@ -250,6 +281,43 @@ def main(xlstm_cfg: DictConfig):
             grip_frame_labels_temp = best_results.grip_frame_labels
             side_upsample_frame_pred_temp = best_results.side_upsample_frame_pred
             side_frame_labels_temp = best_results.side_frame_labels
+
+        # 更新学习率调度器
+        current_lr = scheduler.get_last_lr()[0]
+        scheduler.step()
+
+        # ===================== 保存Checkpoint =====================
+        # 获取当前验证损失（用于保存最佳模型）
+        current_valid_loss = valid_avg.actions_loss.avg
+
+        if is_main_process():
+            model_to_save = model.module if use_ddp else model
+            checkpoint_state = {
+                "epoch": epc + 1,
+                "state_dict": model_to_save.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "valid_loss": current_valid_loss,
+                "best_valid_loss": best_valid_loss,
+            }
+
+            # 按间隔保存模型
+            if save_interval > 0 and (epc + 1) % save_interval == 0:
+                interval_filename = os.path.join(
+                    checkpoint_dir, f"model_epoch_{epc + 1}.pth.tar"
+                )
+                torch.save(checkpoint_state, interval_filename)
+                print(f"Saved checkpoint at epoch {epc + 1}: {interval_filename}")
+
+            # 保存最佳模型
+            if save_best and current_valid_loss < best_valid_loss:
+                best_valid_loss = current_valid_loss
+                checkpoint_state["best_valid_loss"] = best_valid_loss
+                best_filename = os.path.join(checkpoint_dir, "model_best.pth.tar")
+                torch.save(checkpoint_state, best_filename)
+                print(
+                    f"Saved best model at epoch {epc + 1} with valid_loss={current_valid_loss:.6f}"
+                )
 
         # compute action loss std var and sem
         arr_act_mse_list = np.array(best_results.action_mse_list)
@@ -344,10 +412,11 @@ def main(xlstm_cfg: DictConfig):
                 "valid/sucker_loss": valid_avg.sucker_loss.avg,
                 "valid/acc_sucker": valid_avg.sucker_pred_acc.avg,
                 "valid/inference_time": valid_avg.infer_time.avg,
-                # F1 metrics
                 "valid/f1_score": best_results.f1_results["f1"],
                 "valid/precision": best_results.f1_results["precision"],
                 "valid/recall": best_results.f1_results["recall"],
+                # 学习率
+                "train/learning_rate": current_lr,
             }
             wandb.log(wandb_log_dict)
 
@@ -453,16 +522,18 @@ def main(xlstm_cfg: DictConfig):
         )
         # Get model state dict (handle DDP wrapper)
         model_to_save = model.module if use_ddp else model
-        save_checkpoint(
-            {
-                "epoch": epc + 1,
-                "state_dict": model_to_save.state_dict(),
-                # "model": model,   # Removed: sLSTM CUDA extensions are not picklable
-                "optimizer": optimizer.state_dict(),
-            },
-            checkpoint="",
-            filename=f"results/{formatted_datetime}/check_point/model_{formatted_datetime}.pth.tar",
-        )
+        # 保存最终模型 (model_last)
+        last_checkpoint_state = {
+            "epoch": epc + 1,
+            "state_dict": model_to_save.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "valid_loss": valid_avg.actions_loss.avg,
+            "best_valid_loss": best_valid_loss,
+        }
+        last_filename = os.path.join(checkpoint_dir, "model_last.pth.tar")
+        torch.save(last_checkpoint_state, last_filename)
+        print(f"Saved final model: {last_filename}")
 
     # ===================== Cleanup =====================
     if is_main_process() and use_wandb:

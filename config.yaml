@@ -34,6 +34,8 @@ per_episode_to_batch_num: 2
 enc_out_dim: 120
 both_camera_concat_over: w_channel # 两个相机分开处理了，但是代码没改过来，暂时用着这个条件[b, s, c, h, w] --> c_channel / w_channel / s_channel
 is_use_cdna: True
+model_save_interval: 50
+
 # ablation
 is_use_three_phase_train: False   
 is_diff_generate_act: False
