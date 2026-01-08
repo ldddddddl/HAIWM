@@ -111,7 +111,14 @@ def main(xlstm_cfg: DictConfig):
 
     # ===================== Wrap model with DDP =====================
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # find_unused_parameters=True is needed because some model parameters
+        # may not be used in every forward pass (e.g., when olny_action_generate=True)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     writer = ""
 

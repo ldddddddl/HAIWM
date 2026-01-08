@@ -102,7 +102,9 @@ uv run python train.py --config config_libero.yaml
 ```bash
 # 安装 huggingface_hub
 uv pip install huggingface_hub
+```
 
+```bash
 # 下载 LIBERO-100 数据集到指定目录
 uv run python -c "
 from huggingface_hub import snapshot_download
@@ -110,7 +112,8 @@ snapshot_download(
     repo_id='libero-project/LIBERO',
     repo_type='dataset',
     local_dir='./datasets/libero',
-    local_dir_use_symlinks=False
+    local_dir_use_symlinks=False,
+    allow_patterns=['libero_10/*', 'libero_90/*'],
 )
 print('下载完成！')
 "
