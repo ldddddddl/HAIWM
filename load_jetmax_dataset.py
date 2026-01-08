@@ -79,7 +79,9 @@ def ensure_dataset_local(
     repo_name = repo_id.split("/")[-1]
     default_dir = Path(os.getcwd()) / "datasets" / repo_name
     token = os.environ.get("HF_TOKEN")
-    return _snapshot_download_dataset(repo_id=repo_id, local_dir=default_dir, token=token)
+    return _snapshot_download_dataset(
+        repo_id=repo_id, local_dir=default_dir, token=token
+    )
 
 
 def _instantiate_lerobot_dataset(
@@ -202,9 +204,16 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
       - 'wrist_image': torch.FloatTensor, 形状 (3, H, W)，数值范围 [0, 1]
     """
 
-    def __init__(self, base_dataset: torch.utils.data.Dataset, local_root:Path, image_size: int = 0,
-                 decoder_cache_max: int = 32, frame_cache_max: int = 512,
-                 past_img_num: int = 0, future_img_num: int = 0):
+    def __init__(
+        self,
+        base_dataset: torch.utils.data.Dataset,
+        local_root: Path,
+        image_size: int = 0,
+        decoder_cache_max: int = 32,
+        frame_cache_max: int = 512,
+        past_img_num: int = 0,
+        future_img_num: int = 0,
+    ):
         self.base = base_dataset
         self.image_size = image_size  # 0 表示不强制缩放
         self.local_root = local_root
@@ -213,6 +222,7 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
         self.future_img_num = int(max(0, future_img_num))
         # 解码器缓存（按视频路径复用 VideoReader/VideoCapture）
         from collections import OrderedDict as _OD
+
         self._decoder_cache = _OD()
         self._decoder_cache_max = int(decoder_cache_max)
         # 帧级别缓存：键为 (path, idx)，值为张量 (3,H,W)
@@ -251,15 +261,17 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
         # 探测后端
         if self._backend is None:
             try:
-                self._backend = 'decord'
+                self._backend = "decord"
             except Exception:
-                self._backend = 'opencv'
+                self._backend = "opencv"
 
-        if self._backend == 'decord':
+        if self._backend == "decord":
             from decord import VideoReader  # type: ignore
+
             dec = VideoReader(video_path)
         else:
             import cv2  # type: ignore
+
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise RuntimeError(f"无法打开视频: {video_path}")
@@ -271,7 +283,8 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
             old_path, old_dec = self._decoder_cache.popitem(last=False)
             try:
                 import cv2  # type: ignore
-                if hasattr(old_dec, 'release'):
+
+                if hasattr(old_dec, "release"):
                     old_dec.release()
             except Exception:
                 pass
@@ -288,11 +301,12 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
         # 使用缓存的解码器读取帧
         dec = self._get_reader(video_path)
         img = None
-        if self._backend == 'decord':
+        if self._backend == "decord":
             img_np = dec[frame_idx].asnumpy()
             img = img_np
         else:
             import cv2  # type: ignore
+
             dec.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
             ok, frame_bgr = dec.read()
             if not ok:
@@ -301,6 +315,7 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
 
         # 到此 img 为 HWC, uint8/uint类型
         import numpy as _np
+
         if img.dtype != _np.uint8:
             if img.max() <= 1.0:
                 img = (img * 255.0).astype(_np.uint8)
@@ -329,10 +344,11 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
         # 获取视频总帧数，用于越界裁剪/填充
         dec = self._get_reader(video_path)
         try:
-            if self._backend == 'decord':
+            if self._backend == "decord":
                 return len(dec)
             else:
                 import cv2  # type: ignore
+
                 cnt = int(dec.get(cv2.CAP_PROP_FRAME_COUNT))
                 return max(0, cnt)
         except Exception:
@@ -342,10 +358,10 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
     def __del__(self):
         # 释放 opencv 解码器
         try:
-            if getattr(self, '_decoder_cache', None):
+            if getattr(self, "_decoder_cache", None):
                 for _, dec in list(self._decoder_cache.items()):
                     try:
-                        if hasattr(dec, 'release'):
+                        if hasattr(dec, "release"):
                             dec.release()
                     except Exception:
                         pass
@@ -356,10 +372,24 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
         item = self.base[idx]
         item["observation"] = {}
         # 读取与转换键值
-        top_path = self._as_py(item.get("top_video_path")) if "top_video_path" in item else None
-        top_idx = self._as_py(item.get("top_frame_idx")) if "top_frame_idx" in item else None
-        wrist_path = self._as_py(item.get("wrist_video_path")) if "wrist_video_path" in item else None
-        wrist_idx = self._as_py(item.get("wrist_frame_idx")) if "wrist_frame_idx" in item else None
+        top_path = (
+            self._as_py(item.get("top_video_path"))
+            if "top_video_path" in item
+            else None
+        )
+        top_idx = (
+            self._as_py(item.get("top_frame_idx")) if "top_frame_idx" in item else None
+        )
+        wrist_path = (
+            self._as_py(item.get("wrist_video_path"))
+            if "wrist_video_path" in item
+            else None
+        )
+        wrist_idx = (
+            self._as_py(item.get("wrist_frame_idx"))
+            if "wrist_frame_idx" in item
+            else None
+        )
 
         # 若存在引用字段，则在线解码
         if top_path is not None and top_idx is not None:
@@ -375,39 +405,45 @@ class _DecodeVideoRefs(torch.utils.data.Dataset):
                 if total <= 0:
                     # 无法获得帧数时，保守仅返回中心帧重复
                     for _ in range(self.past_img_num + self.future_img_num + 1):
-                        win.append(item["observation"]["top_image"]) 
+                        win.append(item["observation"]["top_image"])
                 else:
                     start = t_top - self.past_img_num
                     end = t_top + self.future_img_num
                     for t in range(start, end + 1):
                         tt = min(max(0, t), total - 1)
                         win.append(self._read_frame(str(top_path), tt))
-                item["observation"]["top_image_seq"] = torch.stack(win, dim=0)  # [S, C, H, W]
+                item["observation"]["top_image_seq"] = torch.stack(
+                    win, dim=0
+                )  # [S, C, H, W]
 
             # 删除原始字符串/索引，避免 DataLoader 默认 collate 产生字符串批次
             item.pop("top_video_path", None)
             item.pop("top_frame_idx", None)
         if wrist_path is not None and wrist_idx is not None:
             t_wrist = int(wrist_idx)
-            item["observation"]["wrist_image"] = self._read_frame(str(wrist_path), t_wrist)
+            item["observation"]["wrist_image"] = self._read_frame(
+                str(wrist_path), t_wrist
+            )
 
             if (self.past_img_num + self.future_img_num) > 0:
                 total = self._get_frame_count(str(wrist_path))
                 win = []
                 if total <= 0:
                     for _ in range(self.past_img_num + self.future_img_num + 1):
-                        win.append(item["observation"]["wrist_image"]) 
+                        win.append(item["observation"]["wrist_image"])
                 else:
                     start = t_wrist - self.past_img_num
                     end = t_wrist + self.future_img_num
                     for t in range(start, end + 1):
                         tt = min(max(0, t), total - 1)
                         win.append(self._read_frame(str(wrist_path), tt))
-                item["observation"]["wrist_image_seq"] = torch.stack(win, dim=0)  # [S, C, H, W]
+                item["observation"]["wrist_image_seq"] = torch.stack(
+                    win, dim=0
+                )  # [S, C, H, W]
 
             item.pop("wrist_video_path", None)
             item.pop("wrist_frame_idx", None)
-        
+
         item["observation"]["state"] = torch.tensor(item["state"], dtype=torch.float32)
         item.pop("state", None)
 
@@ -444,7 +480,8 @@ def load_lerobot_dataloader(
     cache_train_norm_by_split: bool = True,
     past_img_num: int = 0,
     future_img_num: int = 0,
-    image_size: int = 0
+    image_size: int = 0,
+    use_ddp: bool = False,
 ) -> Tuple[DataLoader, DataLoader, object, object]:
     """
     - 检查/下载数据集（Hugging Face Hub）
@@ -453,6 +490,9 @@ def load_lerobot_dataloader(
     - 基于 past_img_num/future_img_num 提取图像序列窗口（t-past..t+future）
     - 使用 norm_stats.json 执行归一化
     - 返回 (train_loader, val_loader, train_dataset, val_dataset)
+
+    Args:
+        use_ddp: Whether to use DistributedDataParallel
     """
     from normalize import load as load_norm
 
@@ -492,6 +532,7 @@ def load_lerobot_dataloader(
         return idxs
 
     from torch.utils.data import Subset
+
     train_indices = _build_indices(train_eps)
     val_indices = _build_indices(val_eps)
     train_ds = Subset(full_ds, train_indices)
@@ -514,7 +555,10 @@ def load_lerobot_dataloader(
             train_norm_dir = base_norm_dir / "train_only"
 
         def _compute_train_norm_stats(ds) -> Dict[str, object]:
-            stats_acc: Dict[str, RunningStats] = {"state": RunningStats(), "action": RunningStats()}
+            stats_acc: Dict[str, RunningStats] = {
+                "state": RunningStats(),
+                "action": RunningStats(),
+            }
             total = len(ds)
             for i in range(total):
                 sample = ds[i]
@@ -572,11 +616,23 @@ def load_lerobot_dataloader(
         # 出错时回退为原数据集（不影响训练的其余部分）
         pass
 
+    # Create samplers for DDP
+    train_sampler = None
+    val_sampler = None
+    if use_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+
+        train_sampler = DistributedSampler(train_ds, shuffle=shuffle, seed=seed)
+        val_sampler = DistributedSampler(val_ds, shuffle=False)
+
     # DataLoader
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(
+            shuffle and train_sampler is None
+        ),  # Only shuffle if not using sampler
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
@@ -584,6 +640,7 @@ def load_lerobot_dataloader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
@@ -670,9 +727,7 @@ def _parse_cli_args():
     parser = argparse.ArgumentParser(
         description="JetMax LeRobot 数据集下载与加载（支持split/horizon/normalize）"
     )
-    parser.add_argument(
-        "--repo-id", default="", help="HF 数据集仓库 ID"
-    )
+    parser.add_argument("--repo-id", default="", help="HF 数据集仓库 ID")
     parser.add_argument(
         "--local-dir", default=None, help="本地数据集目录（默认 datasets/<repo_name>）"
     )

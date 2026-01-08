@@ -11,7 +11,7 @@ HAIWM是一个基于主动推理理论的具身智能机器人世界模型，结
 ## 📔 To do list
 
 - **[·]**: 图像生成
-- **[·]**： More, like attention...
+- **[·]**: More, like attention...
 
 ## 🌟 主要特性
 
@@ -95,6 +95,37 @@ uv run python train.py --config config_libero.yaml
 - `libero_object`: 物体操作任务
 - `libero_goal`: 目标导向任务
 
+#### 手动下载 LIBERO-100 完整数据集
+
+如需下载完整的 LIBERO-100 数据集，请使用以下命令：
+
+```bash
+# 安装 huggingface_hub
+uv pip install huggingface_hub
+
+# 下载 LIBERO-100 数据集到指定目录
+uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='libero-project/LIBERO',
+    repo_type='dataset',
+    local_dir='./datasets/libero',
+    local_dir_use_symlinks=False
+)
+print('下载完成！')
+"
+```
+
+下载后的目录结构：
+```
+datasets/libero/
+├── libero_10/
+├── libero_90/
+├── libero_spatial/
+├── libero_object/
+└── libero_goal/
+```
+
 ## ⚙️ 配置说明
 
 ### config_libero.yaml 主要参数
@@ -155,6 +186,75 @@ uv run python train.py --config config_libero.yaml
 # 指定 GPU
 CUDA_VISIBLE_DEVICES=0 uv run python train.py --config config_libero.yaml
 ```
+
+### 多卡分布式训练 (DDP)
+
+```bash
+# 使用启动脚本（自动检测GPU数量）
+./train_ddp.sh --config config_libero.yaml
+
+# 或指定GPU数量
+NUM_GPUS=2 ./train_ddp.sh --config config_libero.yaml
+```
+
+### ⚠️ 服务器运行常见问题
+
+#### CUDA 架构编译错误
+
+如果遇到以下错误：
+```
+nvcc fatal: Unsupported gpu architecture 'compute_89'
+```
+
+这是因为 xLSTM 的 sLSTM CUDA 扩展在编译时需要正确的 GPU 架构。请按以下步骤解决：
+
+**1. 查看服务器 GPU 的 Compute Capability：**
+```bash
+nvidia-smi --query-gpu=compute_cap --format=csv
+# 或
+python -c "import torch; print(torch.cuda.get_device_capability())"
+```
+
+**2. 查看 nvcc 支持的最高架构版本：**
+```bash
+nvcc --version
+```
+
+| CUDA Toolkit 版本 | 支持的最高架构 |
+|------------------|---------------|
+| CUDA 11.1-11.7   | 8.6 (sm_86)   |
+| CUDA 11.8+       | 8.9 (sm_89)   |
+| CUDA 12.0+       | 9.0 (sm_90)   |
+
+**3. 选择正确的 `TORCH_CUDA_ARCH_LIST` 值：**
+
+> ⚠️ **重要**: 设置值应取 **GPU Compute Capability** 和 **nvcc 支持的最高版本** 中的 **较小值**。
+
+例如：RTX 4090 (8.9) + CUDA 11.7 (最高支持 8.6) → 使用 `8.0` 或 `8.6`
+
+| GPU 型号 | Compute Capability | CUDA 11.7 设置 | CUDA 11.8+ 设置 |
+|----------|-------------------|----------------|----------------|
+| A100     | 8.0               | `8.0`          | `8.0`          |
+| RTX 3090 | 8.6               | `8.6`          | `8.6`          |
+| RTX 4090 | 8.9               | `8.0`          | `8.9`          |
+| H100     | 9.0               | `8.0`          | `9.0`          |
+
+**4. 清除缓存并重新运行：**
+```bash
+# 清除 PyTorch 扩展缓存
+rm -rf ~/.cache/torch_extensions/
+
+# 设置环境变量并运行
+TORCH_CUDA_ARCH_LIST="8.0" uv run python train.py --config config_libero.yaml
+
+# 或添加到 ~/.bashrc 永久生效
+echo 'export TORCH_CUDA_ARCH_LIST="8.0"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+> **提示**: 如果服务器有多种 GPU，可以设置多个架构：`TORCH_CUDA_ARCH_LIST="8.0;8.6"`
+>
+> **注意**: 使用较低架构编译（如在 RTX 4090 上使用 8.0）会通过 PTX JIT 编译运行，功能正常但可能略有性能损失。
 
 ### 训练输出
 

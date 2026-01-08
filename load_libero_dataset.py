@@ -614,6 +614,7 @@ def load_libero_dataloader(
     train_ratio: float = 0.9,
     normalize: bool = True,
     seed: int = 42,
+    use_ddp: bool = False,
 ) -> Tuple[DataLoader, DataLoader, LiberoNormalizer]:
     """
     Load LIBERO dataset and create train/val dataloaders.
@@ -636,6 +637,7 @@ def load_libero_dataloader(
         train_ratio: Ratio for train split
         normalize: Whether to normalize data
         seed: Random seed for splitting
+        use_ddp: Whether to use DistributedDataParallel
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, normalizer)
@@ -673,11 +675,21 @@ def load_libero_dataloader(
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
+    # Create samplers for DDP
+    train_sampler = None
+    val_sampler = None
+    if use_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # Only shuffle if not using sampler
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -687,6 +699,7 @@ def load_libero_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
     )

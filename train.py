@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # from joint_states_process import JointStateRead
 from model.models import ActNet
@@ -34,12 +36,58 @@ import ctypes
 from accelerate.utils import send_to_device
 from tqdm import tqdm
 
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. WandB logging will be disabled.")
+
+
+def setup_ddp():
+    """初始化分布式训练环境"""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """检查是否为主进程（rank 0）"""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def get_world_size():
+    """获取总进程数"""
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
 
 def main(xlstm_cfg: DictConfig):
+    # ===================== DDP Setup =====================
+    use_ddp = getattr(xlstm_cfg, "use_ddp", False)
+    local_rank = 0
+    if use_ddp:
+        local_rank = setup_ddp()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(xlstm_cfg.cuda_visible_devices)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Set seed (ensure reproducibility across ranks)
     seed = set_seed(xlstm_cfg.random_seed)
     xlstm_cfg.random_seed = seed
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(xlstm_cfg.cuda_visible_devices)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     is_use_cuda = torch.cuda.is_available()
     model = ActNet(xlstm_cfg, is_use_cuda=is_use_cuda, device=device).to(device=device)
 
@@ -49,11 +97,21 @@ def main(xlstm_cfg: DictConfig):
         params=model.parameters(), lr=xlstm_cfg.lr, betas=[0.9, 0.99], weight_decay=1e-4
     )
     if xlstm_cfg.is_resume:
-        checkpoint = torch.load(xlstm_cfg.checkpoint_path)
-        model.load_state_dict(checkpoint["state_dict"])
+        checkpoint = torch.load(xlstm_cfg.checkpoint_path, map_location=device)
+        # Handle DDP wrapped model checkpoint
+        state_dict = checkpoint["state_dict"]
+        if use_ddp and not any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+        elif not use_ddp and any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint["optimizer"])
     else:
         model.apply(init_weights)
+
+    # ===================== Wrap model with DDP =====================
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     writer = ""
 
@@ -63,10 +121,27 @@ def main(xlstm_cfg: DictConfig):
 
     pwd = os.getcwd()
 
-    if not os.path.exists(f"{pwd}/{xlstm_cfg.results_path}/{formatted_datetime}"):
-        os.makedirs(f"{xlstm_cfg.results_path}/{formatted_datetime}", exist_ok=True)
-        os.makedirs(
-            f"{xlstm_cfg.results_path}/{formatted_datetime}/check_point", exist_ok=True
+    # Only main process creates directories
+    if is_main_process():
+        if not os.path.exists(f"{pwd}/{xlstm_cfg.results_path}/{formatted_datetime}"):
+            os.makedirs(f"{xlstm_cfg.results_path}/{formatted_datetime}", exist_ok=True)
+            os.makedirs(
+                f"{xlstm_cfg.results_path}/{formatted_datetime}/check_point",
+                exist_ok=True,
+            )
+
+    # ===================== WandB Setup (main process only) =====================
+    use_wandb = getattr(xlstm_cfg, "use_wandb", False) and WANDB_AVAILABLE
+    if is_main_process() and use_wandb:
+        wandb_run_name = (
+            getattr(xlstm_cfg, "wandb_run_name", None) or formatted_datetime
+        )
+        wandb.init(
+            project=getattr(xlstm_cfg, "wandb_project", "HAIWM"),
+            entity=getattr(xlstm_cfg, "wandb_entity", None),
+            name=wandb_run_name,
+            config=OmegaConf.to_container(xlstm_cfg, resolve=True),
+            resume="allow",
         )
 
     results_dict = {}
@@ -95,6 +170,7 @@ def main(xlstm_cfg: DictConfig):
             train_ratio=1.0 - xlstm_cfg.valid_datas_scale,
             normalize=True,
             seed=xlstm_cfg.random_seed,
+            use_ddp=use_ddp,  # Pass DDP flag to dataloader
         )
         train_ds, valid_ds = None, None  # Not needed for LIBERO
     else:
@@ -113,6 +189,7 @@ def main(xlstm_cfg: DictConfig):
                 normalize=True,
                 norm_stats_dir=xlstm_cfg.datasets_path,
                 image_size=xlstm_cfg.cropWidth,
+                use_ddp=use_ddp,  # Pass DDP flag to dataloader
             )
         )
     grip_upsample_frame_pred_temp, grip_frame_labels_temp = None, None
@@ -236,6 +313,37 @@ def main(xlstm_cfg: DictConfig):
             "label_act_ea": valid_avg.label_act_ea.avg,
         }
 
+        # ===================== WandB Logging (main process only) =====================
+        if is_main_process() and use_wandb:
+            wandb_log_dict = {
+                "epoch": epc + 1,
+                # Training metrics
+                "train/actions_loss": train_avg.actions_loss.avg,
+                "train/new_actions_loss": train_avg.new_actions_loss.avg,
+                "train/grip_frames_loss": train_avg.grip_frames_loss.avg,
+                "train/side_frames_loss": train_avg.side_frames_loss.avg,
+                "train/image_kl_loss": train_avg.image_kl_loss.avg,
+                "train/act_kl_loss": train_avg.act_kl_loss.avg,
+                "train/sucker_loss": train_avg.sucker_loss.avg,
+                "train/acc_sucker": train_avg.sucker_pred_acc.avg,
+                # Validation metrics
+                "valid/actions_loss": valid_avg.actions_loss.avg,
+                "valid/actions_std": best_results.act_std,
+                "valid/new_actions_loss": valid_avg.new_actions_loss.avg,
+                "valid/grip_frames_loss": valid_avg.grip_frames_loss.avg,
+                "valid/side_frames_loss": valid_avg.side_frames_loss.avg,
+                "valid/image_kl_loss": valid_avg.image_kl_loss.avg,
+                "valid/act_kl_loss": valid_avg.act_kl_loss.avg,
+                "valid/sucker_loss": valid_avg.sucker_loss.avg,
+                "valid/acc_sucker": valid_avg.sucker_pred_acc.avg,
+                "valid/inference_time": valid_avg.infer_time.avg,
+                # F1 metrics
+                "valid/f1_score": best_results.f1_results["f1"],
+                "valid/precision": best_results.f1_results["precision"],
+                "valid/recall": best_results.f1_results["recall"],
+            }
+            wandb.log(wandb_log_dict)
+
         if best_results.acts_dict is not None:
             actions_prediction = {**actions_prediction, **best_results.acts_dict}
             new_actions_prediction = {
@@ -299,49 +407,61 @@ def main(xlstm_cfg: DictConfig):
                         shape=xlstm_cfg.both_camera_concat_over,
                     )
 
-    writer = pd.ExcelWriter(
-        os.path.join(
-            pwd,
-            xlstm_cfg.results_path,
-            formatted_datetime,
-            formatted_datetime + ".xlsx",
-        ),
-        engine="xlsxwriter",
-    )
-    results_pd = pd.DataFrame.from_dict(results_dict, orient="index")
-    results_act = pd.DataFrame.from_dict(actions_prediction, orient="index")
-    results_new_act = pd.DataFrame.from_dict(new_actions_prediction, orient="index")
-    # total_actions_pd = pd.DataFrame.from_dict(total_actions, orient='index')
-    metrix_frames_result_pd = pd.DataFrame.from_dict(
-        metrix_frames_result, orient="index"
-    )
-    metrix_results_pd = pd.DataFrame.from_dict(metrix_results, orient="index")
-    results_pd.reset_index(inplace=True)
-    results_pd.rename(columns={"index": "Epochs"}, inplace=True)
-    results_pd.to_excel(writer, sheet_name="results", index=False)
-    results_act.to_excel(writer, sheet_name="actions", index=True)
-    results_new_act.to_excel(writer, sheet_name="new_actions", index=True)
-    # total_actions_pd.to_excel(writer, sheet_name='total_actions', index=True)
-    metrix_frames_result_pd.to_excel(
-        writer, sheet_name="frames_metrix_results", index=True
-    )
-    metrix_results_pd.to_excel(writer, sheet_name="metrix_results", index=True)
-    # save_act(writer, actions_predict, actions_label, is_prediction=True)
-    writer.close()
-    OmegaConf.save(
-        xlstm_cfg,
-        os.path.join(pwd, xlstm_cfg.results_path, formatted_datetime, "config.yaml"),
-    )
-    save_checkpoint(
-        {
-            "epoch": epc + 1,
-            "state_dict": model.state_dict(),
-            # "model": model,   # Removed: sLSTM CUDA extensions are not picklable
-            "optimizer": optimizer.state_dict(),
-        },
-        checkpoint="",
-        filename=f"results/{formatted_datetime}/check_point/model_{formatted_datetime}.pth.tar",
-    )
+    # ===================== Save results (main process only) =====================
+    if is_main_process():
+        writer = pd.ExcelWriter(
+            os.path.join(
+                pwd,
+                xlstm_cfg.results_path,
+                formatted_datetime,
+                formatted_datetime + ".xlsx",
+            ),
+            engine="xlsxwriter",
+        )
+        results_pd = pd.DataFrame.from_dict(results_dict, orient="index")
+        results_act = pd.DataFrame.from_dict(actions_prediction, orient="index")
+        results_new_act = pd.DataFrame.from_dict(new_actions_prediction, orient="index")
+        # total_actions_pd = pd.DataFrame.from_dict(total_actions, orient='index')
+        metrix_frames_result_pd = pd.DataFrame.from_dict(
+            metrix_frames_result, orient="index"
+        )
+        metrix_results_pd = pd.DataFrame.from_dict(metrix_results, orient="index")
+        results_pd.reset_index(inplace=True)
+        results_pd.rename(columns={"index": "Epochs"}, inplace=True)
+        results_pd.to_excel(writer, sheet_name="results", index=False)
+        results_act.to_excel(writer, sheet_name="actions", index=True)
+        results_new_act.to_excel(writer, sheet_name="new_actions", index=True)
+        # total_actions_pd.to_excel(writer, sheet_name='total_actions', index=True)
+        metrix_frames_result_pd.to_excel(
+            writer, sheet_name="frames_metrix_results", index=True
+        )
+        metrix_results_pd.to_excel(writer, sheet_name="metrix_results", index=True)
+        # save_act(writer, actions_predict, actions_label, is_prediction=True)
+        writer.close()
+        OmegaConf.save(
+            xlstm_cfg,
+            os.path.join(
+                pwd, xlstm_cfg.results_path, formatted_datetime, "config.yaml"
+            ),
+        )
+        # Get model state dict (handle DDP wrapper)
+        model_to_save = model.module if use_ddp else model
+        save_checkpoint(
+            {
+                "epoch": epc + 1,
+                "state_dict": model_to_save.state_dict(),
+                # "model": model,   # Removed: sLSTM CUDA extensions are not picklable
+                "optimizer": optimizer.state_dict(),
+            },
+            checkpoint="",
+            filename=f"results/{formatted_datetime}/check_point/model_{formatted_datetime}.pth.tar",
+        )
+
+    # ===================== Cleanup =====================
+    if is_main_process() and use_wandb:
+        wandb.finish()
+    if use_ddp:
+        cleanup_ddp()
 
 
 def train(
@@ -751,6 +871,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--procname", default="python", help="设置进程名（Linux），用于 ps/top 显示"
     )
+    parser.add_argument(
+        "--use_ddp", action="store_true", help="启用分布式数据并行训练 (DDP)"
+    )
 
     args = parser.parse_args()
 
@@ -758,6 +881,11 @@ if __name__ == "__main__":
         config_yaml = fp.read()
     xlstm_cfg = OmegaConf.create(config_yaml)
     OmegaConf.resolve(xlstm_cfg)
+
+    # 命令行参数覆盖配置文件
+    if args.use_ddp:
+        xlstm_cfg.use_ddp = True
+
     # 设置进程名（优先使用命令行，其次使用配置文件中的 process_name 字段）
     try:
         configured_name = xlstm_cfg.process_name if "process_name" in xlstm_cfg else ""

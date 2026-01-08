@@ -130,3 +130,13 @@ act_model_enc:
     num_blocks: 2
     embedding_dim: 120
     slstm_at: []
+
+# WandB configuration
+use_wandb: True
+wandb_project: "HAIWM"
+wandb_entity: null  # 可选，设置为您的wandb用户名或团队名
+wandb_run_name: null  # 可选，默认使用时间戳
+
+# Multi-GPU (DDP) training configuration
+use_ddp: False  # 是否启用多卡训练
+local_rank: -1  # 由启动脚本自动设置
