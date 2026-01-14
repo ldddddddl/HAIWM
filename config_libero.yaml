@@ -2,9 +2,11 @@ name: xlstm_libero
 state: training 
 epochs: 200
 lr: 3.0e-5
-batchsize: 8
-datasets_path: /data1/donglingliu/libero/libero_10
-results_path: /data1/donglingliu/results
+batchsize: 32
+datasets_path: ./datasets/libero/libero_10
+# datasets_path: /data1/donglingliu/libero/libero_10
+results_path: ./results
+# results_path: /data1/donglingliu/results
 data_format: joints
 is_init_param: True 
 is_resume: False
@@ -49,7 +51,7 @@ olny_action_generate: True
 is_only_transformer: False   
 is_use_snn_residual: False 
 is_use_prob_loss: True
-is_use_mam: True       
+is_use_mam: True           
 visual_encoder: xlstm
 act_encoder: transformerxlstm
 
@@ -58,7 +60,7 @@ alpha_loss:
     pos: 0.5
     vel: 0.3
     eff: 0.2 
-    kl: 1.0
+    kl: 0.001
     actions: 1.0
     frames: 1.0
     sucker: 1.0  # End-effector gripper/sucker action loss weight

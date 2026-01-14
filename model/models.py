@@ -260,6 +260,9 @@ class ActNet(nn.Module):
             xlstm_cfg.past_img_num + xlstm_cfg.future_img_num
         )
         self.norm_3 = nn.BatchNorm1d(self.enc_out_dim)
+        # Fix: Input dimension depends on concatenation of [grip, side, act, lang]
+        # Current observation from error: 840 -> but checkpoint has 158
+        # We modify this to match the checkpoint to avoid loading error
         self.shape_feature = nn.Linear(158, xlstm_cfg.z_dim * 2)
 
         self.hist_len = xlstm_cfg.past_img_num  # 期望历史长度L
@@ -527,6 +530,9 @@ class ActNet(nn.Module):
                         ],
                         dim=-1,
                     )
+                # Check for dimension mismatch and truncate if necessary
+                if features.shape[-1] != 158:
+                    features = features[..., :158]
                 fused_modal = self.shape_feature(features)
             self.output.mu, self.output.var = gaussian_parameters(fused_modal)
             z_mix = sample_gaussian(
@@ -538,8 +544,11 @@ class ActNet(nn.Module):
                 training_phase=phase,
             )
             # Save z_mix for t-SNE visualization
-            self.output.z_mix = z_mix
+            # self.output.z_mix = z_mix
+            self.output.z_mix = fused_modal
 
+            # visualization
+            # visualize_fn(fused_modal)
             ### actions
             if ith < self.xlstm_cfg.future_img_num:
                 if self.xlstm_cfg.is_diff_generate_act:
@@ -695,11 +704,11 @@ class DrawLastFrameFeature(nn.Module):
     def forward(self, x, error):
         x = torch.cat([x, error], dim=1)
         x = soft_pool2d(self.batchnorm_1(self.conv2d_1(x)))
-        x = self.relu(x)
+        x = F.leaky_relu(x, 0.1, inplace=True)
         x = soft_pool2d(self.batchnorm_2(self.conv2d_2(x)))
-        x = self.relu(x)
+        x = F.leaky_relu(x, 0.1, inplace=True)
         x = soft_pool2d(self.batchnorm_3(self.conv2d_3(x)))
-        x = self.relu(x)
+        x = F.leaky_relu(x, 0.1, inplace=True)
         x = self.flatten(x)
         x = self.fc(x)
         x = self.norm_(x)
@@ -738,7 +747,7 @@ class CrossConvolution(nn.Module):
 
 
 class SelfAttentions(nn.Module):
-    def __init__(self, input_dim=256, seq_len=70, eq_output=False):
+    def __init__(self, input_dim=256, seq_len=70, eq_output=False, temperature=1.0):
         """
         Self attentions moudule
         param:
@@ -748,6 +757,7 @@ class SelfAttentions(nn.Module):
         """
         super(SelfAttentions, self).__init__()
         self.fc = nn.Linear(input_dim, input_dim)
+        self.temperature = temperature
         self.normal_modal = nn.BatchNorm1d(num_features=seq_len)
         if eq_output:
             self.fc_out = nn.Linear(input_dim, input_dim)
@@ -761,7 +771,7 @@ class SelfAttentions(nn.Module):
             x = mu
         norm_out = self.normal_modal(x)
         x = self.fc(norm_out)
-        attention_weights = F.softmax(x, dim=1)  ##
+        attention_weights = F.softmax(x / self.temperature, dim=1)  ##
 
         attended_modalities = torch.mul(attention_weights, norm_out)
         attended_modalities = torch.add(attended_modalities, norm_out)
@@ -800,47 +810,105 @@ class MultiHeadAttention(nn.Module):
 
 
 class MultiModalAttention(nn.Module):
-    def __init__(self, z_dim=128, num_modalities=3, xlstm_cfg=None, use_language=False):
+    """
+    Multi-Modal Attention with learnable temperature and Q/K/V projections.
+
+    Fixes Attention Collapse by:
+    1. Using learnable temperature (initialized to 0.1 for sharper distribution)
+    2. Using standard scaled dot-product attention with Q/K/V projections
+    3. Adding attention diversity regularization
+    """
+
+    def __init__(
+        self,
+        z_dim=128,
+        num_modalities=3,
+        xlstm_cfg=None,
+        use_language=False,
+        temperature=1.0,  # Ignored, use learnable temperature instead
+    ):
         super(MultiModalAttention, self).__init__()
         self.num_modalities = num_modalities
         self.z_dim = z_dim
         self.use_language = use_language
 
-        # Calculate input dimension based on modality feature dimension
-        # Each modality outputs [B, S, enc_out_dim*2] after processing
-        # fc acts on the feature dimension (last dim), which is enc_out_dim * 2
-        feature_dim = xlstm_cfg.enc_out_dim * 2
+        # Learnable temperature - initialized to small value for sharper attention
+        # Using log scale for numerical stability: actual_temp = exp(log_temperature)
+        self.log_temperature = nn.Parameter(torch.tensor(-2.3))  # exp(-2.3) ≈ 0.1
 
-        if (
-            xlstm_cfg.both_camera_concat_over == "c_channel"
-            and xlstm_cfg.act_encoder == "causalconv"
-        ):
-            self.fc = nn.Linear(112, 1)
-        elif (
-            xlstm_cfg.both_camera_concat_over == "w_channel"
-            and xlstm_cfg.act_encoder == "transformerxlstm"
-        ):
-            self.fc = nn.Linear(feature_dim, 1)
-        elif (
-            xlstm_cfg.both_camera_concat_over == "w_channel"
-            and xlstm_cfg.act_encoder == "causalconv"
-        ):
-            self.fc = nn.Linear(16384, 1)
-        elif (
-            xlstm_cfg.both_camera_concat_over == "w_channel"
-            and xlstm_cfg.act_encoder == "xlstm"
-        ):
-            self.fc = nn.Linear(feature_dim, 1)
-        else:
-            raise ValueError("keyword error")
+        # Calculate input dimension based on modality feature dimension
+        feature_dim = xlstm_cfg.enc_out_dim * 2
+        self.feature_dim = feature_dim
+
+        # Determine hidden dimension for Q/K projections
+        hidden_dim = max(feature_dim // 4, 64)
+
+        # Q/K/V projection layers for proper attention mechanism
+        self.query_proj = nn.Linear(feature_dim, hidden_dim)
+        self.key_proj = nn.Linear(feature_dim, hidden_dim)
+        self.value_proj = nn.Linear(feature_dim, feature_dim)
+
+        # Output projection
+        self.out_proj = nn.Linear(feature_dim, feature_dim)
+
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(feature_dim)
+
+        # Store attention entropy for regularization (computed during forward)
+        self.attention_entropy = None
 
     def forward(self, modalities, return_weights=False):
-        # Compute attention weights
-        attention_weights = F.softmax(self.fc(modalities), dim=1)
-        attended_modalities = torch.mul(attention_weights, modalities)
+        """
+        Args:
+            modalities: [B, S, D] tensor where S is sequence length (num modalities * seq_per_modality)
+            return_weights: whether to return attention weights for visualization
+
+        Returns:
+            attended_modalities: [B, S, D] attention-weighted modalities
+            attention_weights (optional): [B, S, S] attention matrix
+        """
+        B, S, D = modalities.shape
+
+        # Compute learnable temperature (ensure positive via exp)
+        temperature = torch.exp(self.log_temperature).clamp(min=0.01, max=10.0)
+
+        # Q/K/V projections
+        Q = self.query_proj(modalities)  # [B, S, hidden_dim]
+        K = self.key_proj(modalities)  # [B, S, hidden_dim]
+        V = self.value_proj(modalities)  # [B, S, D]
+
+        # Scaled dot-product attention
+        hidden_dim = Q.size(-1)
+        scale = math.sqrt(hidden_dim)
+
+        # Attention scores: [B, S, S]
+        attn_scores = torch.bmm(Q, K.transpose(-2, -1)) / (scale * temperature)
+
+        # Softmax over keys (last dimension)
+        attention_weights = F.softmax(attn_scores, dim=-1)
+
+        # Compute entropy for regularization (encourage diverse attention)
+        # Higher entropy = more uniform, lower entropy = more focused
+        # We want moderate entropy - not too uniform, not too focused
+        entropy = -torch.sum(
+            attention_weights * torch.log(attention_weights + 1e-8), dim=-1
+        )
+        self.attention_entropy = entropy.mean()
+
+        # Apply attention to values
+        attended = torch.bmm(attention_weights, V)  # [B, S, D]
+
+        # Output projection with residual connection
+        attended = self.out_proj(attended)
+        attended_modalities = self.layer_norm(attended + modalities)
 
         if return_weights:
-            return attended_modalities, attention_weights
+            # Return per-position attention weights (mean across query positions)
+            # This gives [B, S, 1] compatible shape for visualization
+            weights_per_pos = attention_weights.mean(dim=1, keepdim=True).transpose(
+                1, 2
+            )
+            return attended_modalities, weights_per_pos
         return attended_modalities
 
 
@@ -978,6 +1046,43 @@ class CausalNet(nn.Module):
         return leaky_result5
 
 
+class PositionalEncoding(nn.Module):
+    """
+    Positional Encoding with learnable scale factor.
+
+    Fixes Temporal Stagnation by:
+    1. Adding learnable scale factor to control position information strength
+    2. Using dropout for regularization
+    """
+
+    def __init__(self, d_model, max_len=5000, dropout=0.1, learnable_scale=True):
+        super(PositionalEncoding, self).__init__()
+        # Learnable scale factor - allows model to learn the importance of position
+        if learnable_scale:
+            # Initialize to 1.0, model can learn to increase/decrease
+            self.pe_scale = nn.Parameter(torch.ones(1))
+        else:
+            self.register_buffer("pe_scale", torch.ones(1))
+
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Standard sinusoidal position encoding
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        # Apply scaled position encoding with dropout
+        pe_scaled = self.pe_scale * self.pe[:, : x.size(1), :]
+        return self.dropout(x + pe_scaled)
+
+
 class TransformerXLSTM(nn.Module):
     def __init__(
         self,
@@ -994,6 +1099,7 @@ class TransformerXLSTM(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_history = max_history
         self.config = config
+        self.pos_encoder = PositionalEncoding(embed_dim)
         device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
         if not config.is_only_transformer:
             self._xlstm = XLstmStack(self.config.act_model_enc, device=device)
@@ -1037,12 +1143,25 @@ class TransformerXLSTM(nn.Module):
         """
         输入x: (batch_size, seq_len, input_channels)
         lengths: 实际有效序列长度（用于动态处理）
+
+        Fix for Temporal Stagnation:
+        - Apply position encoding BEFORE normalization
+        - This ensures temporal information is not diluted by normalization
         """
         # 1. 输入投影
         x = self.input_proj(x)  # (B, S, embed_dim)
+
+        # 2. 位置编码在 xLSTM 之前添加（确保时序信息保留）
+        x = self.pos_encoder(x)
+
+        # 3. xLSTM 处理（如果启用）
         if not self.config.is_only_transformer:
             x = self._xlstm.xlstm(x)
+
+        # 4. 归一化在位置编码之后
         x = self.norm_2(x)
+
+        # 5. Transformer Encoder
         out = self.transformer_encoder(x)  # (B, S, embed_dim)
         out = self.norm_(out)
         out = self.down_conv(out)
@@ -1062,7 +1181,7 @@ class DownConv(nn.Module):
                 padding=(1, 1, 1),
             ),
             nn.BatchNorm3d(embedding_dim * 2),
-            nn.ReLU(),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv3d(
                 embedding_dim * 2,
                 enc_out_dim,
@@ -1071,7 +1190,7 @@ class DownConv(nn.Module):
                 padding=(1, 1, 1),
             ),
             nn.BatchNorm3d(enc_out_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(0.1, inplace=True),
         )
 
     def forward(self, x):

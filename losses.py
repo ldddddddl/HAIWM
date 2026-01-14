@@ -5,6 +5,35 @@ from misc import VariableContainer, AverageMeter
 from torch.utils.tensorboard import SummaryWriter
 
 
+def cyclical_kl_weight(
+    epoch: int, total_epochs: int, n_cycles: int = 4, ratio: float = 0.5
+) -> float:
+    """
+    Cyclical KL Annealing: periodically adjusts KL weight from 0 to 1.
+
+    This helps prevent posterior collapse (Dead Latent Dimensions) by:
+    1. Allowing the model to first learn good reconstructions (when KL weight is low)
+    2. Then gradually increasing KL to enforce latent structure
+    3. Repeating this cycle to allow continuous learning
+
+    Args:
+        epoch: Current training epoch
+        total_epochs: Total number of training epochs
+        n_cycles: Number of annealing cycles (default: 4)
+        ratio: Proportion of cycle used for annealing (default: 0.5)
+
+    Returns:
+        KL weight between 0 and 1
+    """
+    cycle_len = max(1, total_epochs // n_cycles)
+    cycle_pos = epoch % cycle_len
+
+    # Linear increase during first 'ratio' of cycle, then constant at 1.0
+    if cycle_pos < cycle_len * ratio:
+        return cycle_pos / (cycle_len * ratio)
+    return 1.0
+
+
 class ComputeLosses(nn.Module):
     """
     forward method:
@@ -120,11 +149,15 @@ class ComputeLosses(nn.Module):
         if phase == "inference":
             phase_alpha_kl = 0.0
         elif phase == "add_kl":
-            phase_alpha_kl = (epoch + 1 - self.config.epochs * 0.5) / (
-                self.config.epochs * 0.25
+            # 使用 Cyclical KL Annealing 替代简单的线性增长
+            phase_alpha_kl = cyclical_kl_weight(
+                epoch, self.config.epochs, n_cycles=4, ratio=0.5
             )
         else:
-            phase_alpha_kl = 1.0
+            # Full training phase 也使用 cyclical annealing
+            phase_alpha_kl = cyclical_kl_weight(
+                epoch, self.config.epochs, n_cycles=4, ratio=0.5
+            )
 
         image_kl = torch.mean(self.kl_normal(pred_results.mu, pred_results.var))
         if pred_results.act_mu is not None or pred_results.act_std is not None:
@@ -236,19 +269,37 @@ class ComputeLosses(nn.Module):
             upsampled_output, target, device, sparse, mean=True
         ), upsampled_output
 
-    def kl_normal(self, qm, qv):
-        # normal gausian
-        # pm = torch.nn.Parameter(
-        #     torch.zeros(self.xlstm_cfg.batchsize, self.xlstm_cfg.z_dim))
-        # pv = torch.nn.Parameter(
-        #     torch.ones(self.xlstm_cfg.batchsize, self.xlstm_cfg.z_dim))
+    def kl_normal(self, qm, qv, free_bits: float = 0.25):
+        """
+        KL divergence with Free Bits constraint.
 
+        Free Bits prevents Dead Latent Dimensions by ensuring each dimension
+        encodes at least 'free_bits' nats of information.
+
+        Args:
+            qm: Posterior mean
+            qv: Posterior variance
+            free_bits: Minimum KL per dimension (default: 0.25 nats)
+
+        Returns:
+            KL divergence with Free Bits constraint applied
+        """
+        # Prior: standard normal N(0, 1)
         pm = torch.zeros_like(qm)
         pv = torch.ones_like(qv)
 
+        # Element-wise KL divergence
         element_wise = 0.5 * (
             torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1
         )
+
+        # Free Bits: clamp minimum KL per dimension
+        # This ensures each dimension is used (prevents dead dimensions)
+        if free_bits > 0:
+            element_wise = torch.maximum(
+                element_wise, torch.tensor(free_bits, device=element_wise.device)
+            )
+
         kl = torch.sum(element_wise, dim=-1)
         return kl
 

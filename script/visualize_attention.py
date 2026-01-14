@@ -55,9 +55,29 @@ def load_model(checkpoint_path: str, config_path: str, device: str):
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
         if "state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["state_dict"])
+            state_dict = checkpoint["state_dict"]
         else:
-            model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        # Remove "module." prefix if present
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+        # Filter out keys with shape mismatch
+        model_state = model.state_dict()
+        keys_to_remove = []
+        for k, v in state_dict.items():
+            if k in model_state:
+                if v.shape != model_state[k].shape:
+                    print(
+                        f"[WARNING] Shape mismatch for {k}: checkpoint {v.shape} != model {model_state[k].shape}. Ignoring."
+                    )
+                    keys_to_remove.append(k)
+
+        for k in keys_to_remove:
+            del state_dict[k]
+
+        model.load_state_dict(state_dict, strict=False)
     else:
         print(f"Warning: Checkpoint not found at {checkpoint_path}")
 
@@ -311,7 +331,7 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoint/model_best.pth.tar",
+        default="./results/model_best.pth.tar",
         help="Path to model checkpoint",
     )
     parser.add_argument(
