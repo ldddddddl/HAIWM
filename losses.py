@@ -146,7 +146,13 @@ class ComputeLosses(nn.Module):
             loss_results.grip_upsample_frame_pred = None
             loss_results.side_upsample_frame_pred = None
         # gdl_loss = self.gdl_loss(pred_results.future_seq, future_labels)
-        if phase == "inference":
+        if phase == "generate":
+            # 在生成阶段，使用标准正态分布 N(0, 1) 替代后验分布参数
+            # 这强制模型从先验分布采样，而非依赖编码器输出
+            pred_results.mu = torch.zeros_like(pred_results.mu)
+            pred_results.var = torch.ones_like(pred_results.var)
+            phase_alpha_kl = 1.0
+        elif phase == "inference":
             phase_alpha_kl = 0.0
         elif phase == "add_kl":
             # 使用 Cyclical KL Annealing 替代简单的线性增长
@@ -186,7 +192,7 @@ class ComputeLosses(nn.Module):
             pred_weights = pred_weights[:, :horizon, :]
             pred_bias = pred_bias[:, :horizon, :]
         new_action = (state_loss_ratio * pred_weights + 1.0) * pred_actions + pred_bias
-        new_action = new_action.clamp(-3.0, 3.0)
+        # new_action = new_action.clamp(-3.0, 3.0)
         loss_results.new_actions = new_action
         critic_loss = self.mse_loss(new_action, joints_pos_labels)
         # total loss

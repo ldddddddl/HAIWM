@@ -9,7 +9,7 @@ Supports two evaluation modes:
 
 Usage:
     python evaluate.py --config config_libero.yaml --checkpoint results/model_best.pth.tar
-    python evaluate.py --config config_libero.yaml --checkpoint results/model_best.pth.tar --mode online --num-episodes 20
+    uv run evaluate.py --config config_libero.yaml --checkpoint results/model_best.pth.tar --mode online --num-episodes 20
 """
 
 import os
@@ -29,7 +29,7 @@ from accelerate.utils import send_to_device
 
 # Project imports
 from model.models import ActNet
-from load_libero_dataset import (
+from script.load_libero_dataset import (
     load_libero_dataloader,
     LiberoNormalizer,
 )

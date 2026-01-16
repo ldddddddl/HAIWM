@@ -290,6 +290,47 @@ uv run python script/visualize_attention.py \
     --output results/attention.png
 ```
 
+### Online Validation
+
+```bash
+# ROBOSUITE LIFT
+.venv/bin/python evaluate.py \
+    --config config_libero.yaml \
+    --checkpoint results/model_best.pth.tar \
+    --mode online \
+    --robosuite-only \
+    --robosuite-task Lift \
+    --num-episodes 5
+    --render # GUI rendering
+```
+
+```bash
+# LIBERO
+.venv/bin/python evaluate.py \
+    --config config_libero.yaml \
+    --checkpoint results/model_best.pth.tar \
+    --mode online \
+    --num-episodes 5
+    --render # GUI rendering
+```
+
+### OFFLINE Validation
+
+```bash
+# 数据集路径必须指定
+.venv/bin/python evaluate.py \
+    --config config_libero.yaml \
+    --checkpoint results/model_best.pth.tar \
+    --data-dir /your/path/to/libero_10
+```
+```bash
+# 快速测试（仅评估10个batch）
+.venv/bin/python evaluate.py \
+    --config config_libero.yaml \
+    --checkpoint results/model_best.pth.tar \
+    --data-dir /your/path/to/libero_10 \
+    --max-batches 10
+```
 ### 成功率评估
 
 ```bash

@@ -565,10 +565,10 @@ class ActNet(nn.Module):
                     next_act = self.act_generate(self.output.act_diff)
                 else:
                     # z_mix_act_out = self.self_attentions(z_mix, act_out.squeeze(-1).squeeze(-1))
-                    z_mix_act_out = torch.cat([z_mix, act_out], dim=-1)
+                    # z_mix_act_out = torch.cat([z_mix, act_out], dim=-1)
                     # z_mix_act_out = self.norm_3(z_mix_act_out)
-                    z_mix_act_out = self.act_attn(z_mix_act_out)
-                    act_mu, act_std, next_act = self.act_generate(z_mix_act_out)
+                    # z_mix_act_out = self.act_attn(z_mix_act_out)
+                    act_mu, act_std, next_act = self.act_generate(z_mix)
                 act_future_seq.append(next_act)
                 if act_mu is not None and act_std is not None:
                     act_mu_list.append(act_mu)

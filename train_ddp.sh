@@ -56,7 +56,8 @@ cd "$SCRIPT_DIR"
 # --nproc_per_node: 每个节点的进程数（即GPU数）
 # --master_port: 分布式通信端口
 # --use_ddp: 启用DDP模式
-exec torchrun \
+# 使用 uv run 确保在虚拟环境中正确运行
+exec uv run python -m torch.distributed.run \
     --nproc_per_node=${NUM_GPUS} \
     --master_port=${MASTER_PORT} \
     train.py \

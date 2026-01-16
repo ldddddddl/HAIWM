@@ -308,7 +308,7 @@ class ActGenerate(nn.Module):
         # output, (h_n, c_n) = self.lstm(x)
         # x = self.linear4(x)
         x = self.conv1d(xlstm_out)
-        action = self.tanh_(self.linear6(x))
+        action = self.linear6(x)
         # action = action.clamp(-20.0, 240.0)
         # x = self.transformer_decoder(tgt, x)
         # mean = self.tanh_(self.mean(x)) * 2

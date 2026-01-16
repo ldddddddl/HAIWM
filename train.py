@@ -31,7 +31,7 @@ from spikingjelly.activation_based import functional
 from scipy import stats
 import numpy as np
 from script.metrics import calc_metrics
-from load_jetmax_dataset import load_lerobot_dataloader
+from script.load_jetmax_dataset import load_lerobot_dataloader
 import ctypes
 from accelerate.utils import send_to_device
 from tqdm import tqdm
@@ -173,7 +173,7 @@ def main(xlstm_cfg: DictConfig):
 
     if use_libero:
         # Use LIBERO dataloader for libero datasets
-        from load_libero_dataset import load_libero_dataloader
+        from script.load_libero_dataset import load_libero_dataloader
 
         task_suite = getattr(xlstm_cfg, "task_suite", "libero_10")
         local_dir = xlstm_cfg.datasets_path if xlstm_cfg.datasets_path else None
@@ -945,7 +945,7 @@ if __name__ == "__main__":
     # if not rospy.core.is_initialized():
     #     rospy.init_node('act_generate', anonymous=True, log_level=rospy.DEBUG)
     parser = ArgumentParser()
-    parser.add_argument("--config", default=r"./config.yaml")
+    parser.add_argument("--config", default=r"./config_libero.yaml")
     parser.add_argument(
         "--procname", default="python", help="设置进程名（Linux），用于 ps/top 显示"
     )
@@ -961,8 +961,9 @@ if __name__ == "__main__":
     OmegaConf.resolve(xlstm_cfg)
 
     # 命令行参数覆盖配置文件
-    if args.use_ddp:
-        xlstm_cfg.use_ddp = True
+    # 只有当命令行明确指定 --use_ddp 时才启用 DDP
+    # 直接 debug 运行时（没有 --use_ddp 参数）将使用单卡训练
+    xlstm_cfg.use_ddp = args.use_ddp
 
     # 设置进程名（优先使用命令行，其次使用配置文件中的 process_name 字段）
     try:

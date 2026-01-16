@@ -243,7 +243,7 @@ def main():
         help="Output path for visualization",
     )
     parser.add_argument(
-        "--n-samples", type=int, default=500, help="Number of samples to collect"
+        "--n-samples", type=int, default=1000, help="Number of samples to collect"
     )
     parser.add_argument(
         "--method",

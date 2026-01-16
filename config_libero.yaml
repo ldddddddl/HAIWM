@@ -1,9 +1,9 @@
 name: xlstm_libero
 state: training 
-epochs: 200
+epochs: 100
 lr: 3.0e-5
-batchsize: 32
-datasets_path: ./datasets/libero/libero_10
+batchsize: 1
+datasets_path: ./datasets/libero/libero_test
 # datasets_path: /data1/donglingliu/libero/libero_10
 results_path: ./results
 # results_path: /data1/donglingliu/results
@@ -18,7 +18,7 @@ cropHeight: 112
 z_dim: 120
 z_attention: true 
 random_seed: 42
-valid_datas_scale: 0.1
+valid_datas_scale: 0.5
 per_image_with_signal_num: 20 
 cuda_visible_devices: 0
 horizon: 50
@@ -45,7 +45,7 @@ clip_embed_dim: 512
 language_output_dim: 120  # Project CLIP embedding to match other modalities
 
 # ablation
-is_use_three_phase_train: False   
+is_use_three_phase_train: True   
 is_diff_generate_act: False
 olny_action_generate: True  
 is_only_transformer: False   
@@ -120,7 +120,7 @@ act_model_dnc:
             num_heads: 4
     context_length: 120
     num_blocks: 2
-    embedding_dim: 360
+    embedding_dim: 120
     slstm_at: []
 
 act_model_enc: 
@@ -135,7 +135,7 @@ act_model_enc:
     slstm_at: []
 
 # WandB configuration
-use_wandb: True
+use_wandb: False
 wandb_project: "HAIWM"
 wandb_entity: null  # 可选，设置为您的wandb用户名或团队名
 wandb_run_name: null  # 可选，默认使用时间戳
