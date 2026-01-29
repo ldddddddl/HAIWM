@@ -90,9 +90,10 @@ class ActNet(nn.Module):
 
             # Projection layer to match language dim to visual/action feature dim
             self.language_proj = nn.Linear(language_output_dim, self.enc_out_dim)
-            # Update modalities_seq_dim: language adds 1 sequence position (not enc_out_dim)
-            # Total = 120*2 (visual) + 120 (action) + 1 (language) = 361
-            self.modalities_seq_dim += 1
+            # Update modalities_seq_dim: language adds same sequence length as visual modality
+            # to ensure language context influences every timestep (embodied AI principle)
+            # Total = 120*2 (visual) + 120 (action) + 120 (language) = 480
+            self.modalities_seq_dim += xlstm_cfg.model.embedding_dim
             num_modalities = 3  # visual x2 + action + language
         else:
             self.language_encoder = None
@@ -499,8 +500,16 @@ class ActNet(nn.Module):
                     lang_embedding = self.language_proj(
                         lang_embedding
                     )  # [B, enc_out_dim]
-                    # Expand to match other modality dimensions [B, 1, enc_out_dim]
-                    lang_embedding = lang_embedding.unsqueeze(1)
+                    # Expand to match other modality dimensions
+                    # Language embedding should have same sequence length as visual modalities
+                    # to ensure language context influences every timestep (embodied AI principle)
+                    lang_embedding = lang_embedding.unsqueeze(1)  # [B, 1, enc_out_dim]
+                    target_seq_len = grip_visual_out.size(
+                        1
+                    )  # Get sequence length from visual modality
+                    lang_embedding = lang_embedding.expand(
+                        -1, target_seq_len, -1
+                    )  # [B, seq_len, enc_out_dim]
                     modalities_list.append(lang_embedding)
                 # Get attention weights for visualization
                 fused_modal, attn_weights = self.modal_fusion_model(
@@ -932,14 +941,15 @@ class MultiModalFusionModel(nn.Module):
         # Calculate modalities_seq_dim (number of sequence positions after concat on dim=1)
         # Visual modalities: each has [B, 120, 240] = [B, seq_len, features]
         # Action modality: [B, 120, 240]
-        # Language modality: [B, 1, 240] (single token after projection)
+        # Language modality: [B, 120, 240] (expanded to match visual sequence length)
         if use_language:
-            # Language adds 1 sequence position, not enc_out_dim positions
-            language_seq_len = 1
+            # Language is expanded to same sequence length as visual modality
+            # to ensure language context influences every timestep (embodied AI principle)
+            language_seq_len = xlstm_cfg.model.embedding_dim
             modalities_seq_dim = (
                 xlstm_cfg.model.embedding_dim * 2  # 120 * 2 = 240 from visual
                 + xlstm_cfg.act_model_enc.embedding_dim  # 120 from action
-                + language_seq_len  # 1 from language
+                + language_seq_len  # 120 from language (expanded)
             )
         else:
             modalities_seq_dim = (
