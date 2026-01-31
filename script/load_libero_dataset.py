@@ -167,10 +167,27 @@ class LiberoNormalizer:
 
     @staticmethod
     def compute_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute mean and std for normalization."""
+        """Compute mean and std for normalization.
+
+        Uses a minimum std threshold to prevent numerical instability.
+        For dimensions with near-zero std (constant values), uses a higher
+        minimum to avoid extreme normalized values.
+        """
+        mean = np.mean(data, axis=0)
+        std = np.std(data, axis=0)
+
+        # Use a larger minimum std threshold to prevent numerical issues
+        # When std is very small (< 0.01), the data is nearly constant
+        # In this case, we use 1.0 as std so normalized values stay near 0
+        MIN_STD_THRESHOLD = 0.01
+        MIN_STD_VALUE = 1.0  # Use 1.0 so constant values normalize to ~0
+
+        # For dimensions with very small std, use MIN_STD_VALUE
+        std = np.where(std < MIN_STD_THRESHOLD, MIN_STD_VALUE, std)
+
         return {
-            "mean": np.mean(data, axis=0),
-            "std": np.std(data, axis=0) + 1e-8,  # Avoid division by zero
+            "mean": mean,
+            "std": std,
         }
 
     def normalize(self, data: torch.Tensor, key: str) -> torch.Tensor:
@@ -191,6 +208,9 @@ class LiberoNormalizer:
         mean = torch.tensor(stats["mean"], dtype=data.dtype, device=data.device)
         std = torch.tensor(stats["std"], dtype=data.dtype, device=data.device)
 
+        # Clamp std to prevent division by very small numbers
+        std = torch.clamp(std, min=0.01)
+
         return (data - mean) / std
 
     def denormalize(self, data: torch.Tensor, key: str) -> torch.Tensor:
@@ -210,6 +230,9 @@ class LiberoNormalizer:
         stats = self.norm_stats[key]
         mean = torch.tensor(stats["mean"], dtype=data.dtype, device=data.device)
         std = torch.tensor(stats["std"], dtype=data.dtype, device=data.device)
+
+        # Clamp std to match normalization behavior
+        std = torch.clamp(std, min=0.01)
 
         return data * std + mean
 

@@ -2,7 +2,7 @@ name: xlstm_libero
 state: training 
 epochs: 100
 lr: 3.0e-5
-batchsize: 1
+batchsize: 4
 datasets_path: ./datasets/libero/libero_test
 # datasets_path: /data1/donglingliu/libero/libero_10
 results_path: ./results
