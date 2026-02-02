@@ -186,12 +186,23 @@ def reparameterize(mu, logvar):
 def sample_gaussian(
     m, v, device, training_phase=None, z_attention=False, SelfAttentions=None
 ):
+    """
+    Sample from a Gaussian distribution using reparameterization trick.
+
+    Note: For deterministic inference (e.g., overfit verification),
+    pass training_phase="eval" to disable random sampling and use mean directly.
+    """
     if training_phase == "generate":
         m = torch.zeros_like(m)  # zero
         v = torch.ones_like(v)  # one
-    # reparameterize
-    epsilon = Normal(0, 1).rsample(m.size())
-    z = m + torch.sqrt(v) * epsilon.to(device)
+
+    # Deterministic mode for evaluation: use mean directly without sampling
+    if training_phase == "eval":
+        z = m  # No sampling, use mean directly
+    else:
+        # reparameterize (standard VAE sampling)
+        epsilon = Normal(0, 1).rsample(m.size())
+        z = m + torch.sqrt(v) * epsilon.to(device)
 
     if z_attention and SelfAttentions is not None:
         #### add self-attentions to mu, var

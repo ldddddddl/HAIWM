@@ -425,7 +425,10 @@ class LiberoDataset(Dataset):
         all_states = []
 
         # Sample a subset for efficiency
-        sample_indices = np.random.choice(
+        # CRITICAL: Use fixed seed to ensure reproducible normalization statistics
+        # This prevents discrepancy between training and validation
+        rng = np.random.RandomState(42)  # Fixed seed for reproducibility
+        sample_indices = rng.choice(
             len(self.samples), min(1000, len(self.samples)), replace=False
         )
 
